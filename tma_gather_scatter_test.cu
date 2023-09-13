@@ -239,8 +239,7 @@ __global__ void scatter_func_kernel(const InputT* input,
   const InputT* input_ptr  = input + input_desc.start_off + input_stride * input_idx;
   int64_t embedding_offset = embedding_desc.start_off + embedding_table_idx * embedding_stride;
   for (; input_idx < indice_count; input_idx += static_cast<int64_t>(gridDim.x) * blockDim.y) {
-    for (int emb_idx = thread_idx * ALIGNMENT; emb_idx < embedding_size;
-         emb_idx += ALIGNMENT * blockDim.x) {
+    for (int emb_idx = thread_idx * ALIGNMENT; emb_idx < embedding_size; emb_idx += ALIGNMENT * blockDim.x) {
       mov_data<sizeof(InputT) * ALIGNMENT>(&inputs, input_ptr + emb_idx);
 #pragma unroll
       for (int sub_idx = 0; sub_idx < ALIGNMENT; sub_idx++) {
@@ -253,6 +252,8 @@ __global__ void scatter_func_kernel(const InputT* input,
   }
 }
 
+#define shm_size (16384/sizeof(EmbeddingT))//TODO this may be important
+template <int ALIGNMENT = 3>
 __global__ void scatter_kernel_TMA(const InputT* input,
                                     desc input_desc,
                                     const IndexT* indices,
@@ -263,42 +264,37 @@ __global__ void scatter_kernel_TMA(const InputT* input,
   auto grid = cooperative_groups::this_grid();
   auto block = cooperative_groups::this_thread_block();
   extern __shared__ EmbeddingT shared[];
-#ifdef USE_BARRIER
-  __shared__ cuda::barrier<cuda::thread_scope::thread_scope_block> barrier;
-  if (block.thread_rank() == 0) {
-    init(&barrier, block.size()); // Friend function initializes barrier
-  }
-  block.sync();
-#endif 
   int embedding_size       = embedding_desc.dim;
   int64_t embedding_stride = embedding_desc.stride;
   int block_idx = block.group_index().x;
   int64_t input_stride     = input_desc.stride;
-  for (int64_t input_idx = block_idx; input_idx < indice_count; input_idx += grid.num_blocks()) {
-    int64_t embedding_table_idx = indices[input_idx];
-    const InputT* input_ptr  = input + input_desc.start_off + input_stride * input_idx;
-    EmbeddingT* emb_ptr = embedding + embedding_desc.start_off + embedding_table_idx * embedding_stride;
+  int batch_size = shm_size/input_stride;//indices batch size in lines
+  typed_data_vector<EmbeddingT, ALIGNMENT> embeddings;
+  typed_data_vector<InputT, ALIGNMENT> inputs;
+  for (int64_t input_idx = block_idx*batch_size; input_idx < indice_count; input_idx += grid.num_blocks()*batch_size) {
+	  int cur_idx_lines = (indice_count - input_idx) > batch_size ? batch_size : indice_count - input_idx;
+	  const InputT* input_ptr = input + input_desc.start_off + input_stride * input_idx;
+	  cooperative_groups::memcpy_async(block, shared, (EmbeddingT*)(input_ptr), sizeof(EmbeddingT)*cur_idx_lines*input_stride);
+	  cooperative_groups::wait(block);
+	  for (int e = 0; e < cur_idx_lines; e ++) {
+		  int64_t embedding_table_idx = indices[input_idx + e];
+	  	EmbeddingT *emb_ptr = embedding + embedding_desc.start_off + embedding_table_idx*embedding_stride;
+      
+      for (int emb_idx = block.thread_rank() * ALIGNMENT; emb_idx < embedding_size; emb_idx += ALIGNMENT * block.size()) {
+        mov_data<sizeof(InputT) * ALIGNMENT>(&inputs, shared +e*input_stride + emb_idx);
 #pragma unroll
-    for (int embInnerOff = 0; embInnerOff < embedding_size; embInnerOff += block.size()) {
-      int copy_size = embedding_size - embInnerOff;
-      copy_size = copy_size > block.size() ? block.size() : copy_size;
-#ifdef USE_BARRIER
-      cuda::memcpy_async(block, shared, (EmbeddingT*)(input_ptr) + embInnerOff, sizeof(EmbeddingT)*copy_size, barrier);
-      barrier.arrive_and_wait();
-      cuda::memcpy_async(block, emb_ptr + embInnerOff, shared, sizeof(EmbeddingT)*copy_size, barrier);
-      barrier.arrive_and_wait();
-#else
-      cooperative_groups::memcpy_async(block, shared, (EmbeddingT*)(input_ptr) + embInnerOff, sizeof(EmbeddingT)*copy_size);
-      cooperative_groups::wait(block);
-      cooperative_groups::memcpy_async(block, emb_ptr + embInnerOff, shared, sizeof(EmbeddingT)*copy_size);
-      cooperative_groups::wait(block);
-#endif
-    }
-
+        for (int sub_idx = 0; sub_idx < ALIGNMENT; sub_idx++) {
+          typed_data_vector_at(embeddings, sub_idx) =
+            convert_type<InputT, EmbeddingT>(typed_data_vector_at(inputs, sub_idx));
+        }
+        mov_data<sizeof(EmbeddingT) * ALIGNMENT>(emb_ptr + emb_idx, &embeddings);
+      }
+	  }
+    block.sync();
   }
   return ;
 }
-template<uint8_t stage_count = 2>//TODO set stage count to 2
+template<int ALIGNMENT = 3,uint8_t stage_count = 2>//TODO set stage count to 2
 __global__ void scatter_kernel_TMA_pipeline(const InputT* input,
                                     desc input_desc,
                                     const IndexT* indices,
@@ -306,52 +302,57 @@ __global__ void scatter_kernel_TMA_pipeline(const InputT* input,
                                     EmbeddingT* embedding,
                                     desc emb_desc)
 {
-  auto grid = cooperative_groups::this_grid();
+  //auto grid = cooperative_groups::this_grid();
   auto block = cooperative_groups::this_thread_block();
 
   extern __shared__ EmbeddingT shared[]; // stages_count * block.size() * sizeof(int) bytes
-  int shared_off[stage_count];
-  for (int s = 0; s < stage_count; ++s) shared_off[s] = s * block.size();
-
+  
   __shared__ cuda::pipeline_shared_state<cuda::thread_scope::thread_scope_block,stage_count> shared_state;
   auto pipeline = cuda::make_pipeline(block, &shared_state);
 
+  int input_stride = input_desc.stride;
+  int batch_size = shm_size/stage_count/input_stride;
   int block_idx = block.group_index().x;
-  int my_emb_size = indice_count % grid.num_blocks() > block_idx ? 1 : 0;
-  my_emb_size += (indice_count/grid.num_blocks());
-  int times_per_emb = (emb_desc.dim + block.size() -1 )/block.size();
-  int my_batch_size = my_emb_size * times_per_emb;
+  int my_batch_num = ((indice_count+batch_size-1)/batch_size) % gridDim.x > block_idx ? 1 : 0;
+  my_batch_num += indice_count/(batch_size*gridDim.x);
+  
+  typed_data_vector<EmbeddingT, ALIGNMENT> embeddings;
+  typed_data_vector<InputT, ALIGNMENT> inputs;
 
-  for (int get_batch = 0, put_batch = 0; put_batch < my_batch_size; put_batch ++) {
-    for (; get_batch < my_batch_size && get_batch < (put_batch + stage_count); get_batch ++) {
-      int64_t input_idx = (get_batch / times_per_emb)*grid.num_blocks() + block_idx;
-      int emb_inner_off = (get_batch % times_per_emb) * block.size();
-      int copy_size = (emb_desc.dim - emb_inner_off) > block.size() ? block.size() : (emb_desc.dim - emb_inner_off);
-      int shared_index = get_batch % stage_count;
-      EmbeddingT *in_address = (EmbeddingT*)(input + input_desc.start_off + input_desc.stride * input_idx) + emb_inner_off;
+  for (int get_batch = 0, put_batch = 0; put_batch < my_batch_num; put_batch ++) {
+    for (; get_batch < my_batch_num && get_batch < (put_batch + stage_count); get_batch ++) {
+      int64_t input_idx = (get_batch * gridDim.x + block_idx) * batch_size;
+      int idx_line_num = (indice_count - input_idx) > batch_size ? batch_size : (indice_count - input_idx);
+      int shared_off = (get_batch % stage_count)*batch_size*input_stride;
+      EmbeddingT *in_addr = (EmbeddingT*)(input + input_desc.start_off + input_stride * input_idx);
       pipeline.producer_acquire();
-      //int tid = block.thread_rank();
-      //if (tid < copy_size)
-        //shared[shared_off[shared_index]+tid] = in_address[tid];
-      cuda::memcpy_async(block, shared+shared_off[shared_index], in_address, sizeof(EmbeddingT)*copy_size, pipeline);
+      cuda::memcpy_async(block, shared+shared_off, in_addr, sizeof(EmbeddingT)*idx_line_num*input_stride, pipeline);
       pipeline.producer_commit();
     }
-    int64_t embedding_idx = (put_batch/times_per_emb)*grid.num_blocks() + block_idx;
-    embedding_idx = indices[embedding_idx];
-    int emb_inner_off = (put_batch % times_per_emb) * block.size();
-    int copy_size = (emb_desc.dim - emb_inner_off) > block.size() ? block.size() : (emb_desc.dim - emb_inner_off);
-    int shared_index = put_batch % stage_count;
-    EmbeddingT *out_address = embedding + emb_desc.start_off + emb_desc.stride * embedding_idx + emb_inner_off;
+    int64_t input_idx = (put_batch * gridDim.x + block_idx) * batch_size;
+    int idx_line_num = (indice_count - input_idx) > batch_size ? batch_size : (indice_count - input_idx);
     pipeline.consumer_wait();
-    //int tid = block.thread_rank();
-    //if (tid < copy_size) {
-      //printf("from block %d thread %d, original is %d, now is %d\n", block_idx, block.thread_rank(), out_address[tid], shared[shared_off[shared_index] + tid]);
-      //out_address[tid] = shared[shared_off[shared_index] + tid];
-    //}
-    cuda::memcpy_async(block, out_address, shared+shared_off[shared_index], sizeof(EmbeddingT)*copy_size, pipeline);
+    for (int e = 0; e < idx_line_num; e ++) {
+      int64_t emb_idx = indices[input_idx+e];
+      EmbeddingT* out_addr = embedding + emb_desc.start_off + emb_desc.stride*emb_idx;
+      int shared_off = (put_batch % stage_count)* batch_size*input_stride;
+      for (int emb_idx = block.thread_rank(); emb_idx < emb_desc.dim; emb_idx += block.size()) {
+        out_addr[emb_idx] = shared[shared_off+e*input_stride+emb_idx];
+      }
+      /*for (int emb_idx = block.thread_rank() * ALIGNMENT; emb_idx < emb_desc.dim; emb_idx += ALIGNMENT * block.size()) {
+        mov_data<sizeof(InputT) * ALIGNMENT>(&inputs, shared + shared_off + e*input_stride + emb_idx);
+#pragma unroll
+        for (int sub_idx = 0; sub_idx < ALIGNMENT; sub_idx++) {
+          typed_data_vector_at(embeddings, sub_idx) =
+            convert_type<InputT, EmbeddingT>(typed_data_vector_at(inputs, sub_idx));
+        }
+        mov_data<sizeof(EmbeddingT) * ALIGNMENT>(out_addr + emb_idx, &embeddings);
+      }*/
+    }
+    //block.sync();
     pipeline.consumer_release();
+    block.sync();
   }
-  //block.sync();
   return ;
 }
 
@@ -389,32 +390,17 @@ void scatter_temp_func(InputT* input,
                     desc) = nullptr;
   //printf("key parameters: %d %d %d %d\n",thread_x, thread_y, block_count, alignment);
   switch (alignment) {
-    case 16: {
-      kernel_fn = scatter_func_kernel<16>;
-      break;
-    }
-    case 8: {
-      kernel_fn = scatter_func_kernel<8>;
-      break;
-    }
-    case 4: {
-      kernel_fn = scatter_func_kernel<4>;
-      break;
-    }
-    case 2: {
-      kernel_fn = scatter_func_kernel<2>;
-      break;
-    }
-    case 1: {
-      kernel_fn = scatter_func_kernel<1>;
-      break;
-    }
+    case 16: {kernel_fn = scatter_func_kernel<16>;break;}
+    case 8: {kernel_fn = scatter_func_kernel<8>;break;}
+    case 4: {kernel_fn = scatter_func_kernel<4>;break;}
+    case 2: {kernel_fn = scatter_func_kernel<2>;break;}
+    case 1: {kernel_fn = scatter_func_kernel<1>;break;}
     default: {
       printf("scatter func alignment=%d.\n", alignment);
       return;
     }
   }
-  #endif
+#endif
   cudaEvent_t start, stop;
 	float esp_time_gpu;
 	CUDA_TRY(cudaEventCreate(&start));
@@ -429,10 +415,27 @@ void scatter_temp_func(InputT* input,
                                         embedding_desc);
 #endif
 #ifdef TMA_COPY
-  int block_size = embedding_desc.dim;
+  void (*kernel_fn)(const InputT*,
+                    desc,
+                    const IndexT*,
+                    int,
+                    EmbeddingT*,
+                    desc) = nullptr;
+  //printf("key parameters: %d %d %d %d\n",thread_x, thread_y, block_count, alignment);
+  switch (alignment) {
+    case 16: {  kernel_fn = scatter_kernel_TMA<16>; break;}
+    case 8: {  kernel_fn = scatter_kernel_TMA<8>; break;}
+    case 4: {  kernel_fn = scatter_kernel_TMA<4>; break;}
+    case 2: {  kernel_fn = scatter_kernel_TMA<2>; break;}
+    case 1: {  kernel_fn = scatter_kernel_TMA<1>; break;}
+    default: {
+      printf("scatter func alignment=%d.\n", alignment); return;
+    }
+  }
+  int block_size = (embedding_desc.dim + alignment-1)/alignment;
   block_size = block_size > 512 ? 512 : block_size;
-  int block_count = indice_count > 4096 ? 4096 : indice_count;
-  scatter_kernel_TMA<<<block_count, block_size, block_size*sizeof(EmbeddingT)>>>(input,
+  int block_count = indice_count > 1024 ? 1024 : indice_count;
+  kernel_fn<<<block_count, block_size, shm_size*sizeof(EmbeddingT)>>>(input,
                                                                           input_desc,
                                                                           indices,
                                                                           indice_count,
@@ -440,11 +443,27 @@ void scatter_temp_func(InputT* input,
                                                                           embedding_desc);
 #endif
 #ifdef TMA_PIPELINE_COPY
-  int block_size = embedding_desc.dim;
+   void (*kernel_fn)(const InputT*,
+                    desc,
+                    const IndexT*,
+                    int,
+                    EmbeddingT*,
+                    desc) = nullptr;
+  //printf("key parameters: %d %d %d %d\n",thread_x, thread_y, block_count, alignment);
+  switch (alignment) {
+    case 16: {  kernel_fn = scatter_kernel_TMA_pipeline<16,2>; break;}
+    case 8: {  kernel_fn = scatter_kernel_TMA_pipeline<8,2>; break;}
+    case 4: {  kernel_fn = scatter_kernel_TMA_pipeline<4,2>; break;}
+    case 2: {  kernel_fn = scatter_kernel_TMA_pipeline<2,2>; break;}
+    case 1: {  kernel_fn = scatter_kernel_TMA_pipeline<1,2>; break;}
+    default: {
+      printf("scatter func alignment=%d.\n", alignment); return;
+    }
+  }
+  int block_size = (embedding_desc.dim + alignment-1)/alignment;
   block_size = block_size > 256 ? 256 : block_size;
   int block_count = indice_count > 4096 ? 4096 : indice_count;
-  scatter_kernel_TMA_pipeline<<<block_count, block_size, 
-                                2*block_size*sizeof(EmbeddingT)>>>(input,
+  kernel_fn<<<block_count, block_size, shm_size*sizeof(EmbeddingT)>>>(input,
                                                                    input_desc,
                                                                    indices,
                                                                    indice_count,
@@ -470,7 +489,7 @@ int main (int argc, char**argv) {
   if (argc > 3) input_start_off = atoi(argv[3]);
   int input_dim = embedding_dim;
   uint64_t embedding_size = 10 * 1024UL * 1024UL;
-  uint64_t input_size = 5* 1024UL * 1024UL;
+  uint64_t input_size = 5 * 1024UL * 1024UL;
 
   //construct input
   InputT *input;
@@ -583,6 +602,7 @@ int main (int argc, char**argv) {
     else 
       printf("    the %d th iteration didn't pass!\n", iter);
 #endif
+    thrust::sequence(thrust::device, embedding+emb_start_off, embedding+emb_malloc_size, 0);
     printf("\n");
   }
 #ifdef QUICK_VALIDATION
