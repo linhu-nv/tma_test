@@ -253,6 +253,7 @@ __global__ void scatter_func_kernel(const InputT* input,
 }
 
 #define shm_size (16384/sizeof(EmbeddingT))//TODO this may be important
+//#define shm_size (4096/sizeof(EmbeddingT))//TODO this may be important
 template <int ALIGNMENT = 3>
 __global__ void scatter_kernel_TMA(const InputT* input,
                                     desc input_desc,
@@ -336,10 +337,10 @@ __global__ void scatter_kernel_TMA_pipeline(const InputT* input,
       int64_t emb_idx = indices[input_idx+e];
       EmbeddingT* out_addr = embedding + emb_desc.start_off + emb_desc.stride*emb_idx;
       int shared_off = (put_batch % stage_count)* batch_size*input_stride;
-      for (int emb_idx = block.thread_rank(); emb_idx < emb_desc.dim; emb_idx += block.size()) {
+      /*for (int emb_idx = block.thread_rank(); emb_idx < emb_desc.dim; emb_idx += block.size()) {
         out_addr[emb_idx] = shared[shared_off+e*input_stride+emb_idx];
-      }
-      /*for (int emb_idx = block.thread_rank() * ALIGNMENT; emb_idx < emb_desc.dim; emb_idx += ALIGNMENT * block.size()) {
+      }*/
+      for (int emb_idx = block.thread_rank() * ALIGNMENT; emb_idx < emb_desc.dim; emb_idx += ALIGNMENT * block.size()) {
         mov_data<sizeof(InputT) * ALIGNMENT>(&inputs, shared + shared_off + e*input_stride + emb_idx);
 #pragma unroll
         for (int sub_idx = 0; sub_idx < ALIGNMENT; sub_idx++) {
@@ -347,7 +348,7 @@ __global__ void scatter_kernel_TMA_pipeline(const InputT* input,
             convert_type<InputT, EmbeddingT>(typed_data_vector_at(inputs, sub_idx));
         }
         mov_data<sizeof(EmbeddingT) * ALIGNMENT>(out_addr + emb_idx, &embeddings);
-      }*/
+      }
     }
     //block.sync();
     pipeline.consumer_release();
