@@ -14,8 +14,8 @@
 using namespace std;
 //#define QUICK_VALIDATION
 //#define NAIVE_COPY
-//#define TMA_COPY
-#define TMA_PIPELINE_COPY
+#define TMA_COPY
+//#define TMA_PIPELINE_COPY
 //#define USE_BARRIER
 
 typedef uint32_t InputT;
@@ -252,7 +252,7 @@ __global__ void scatter_func_kernel(const InputT* input,
   }
 }
 
-#define shm_size (16384/sizeof(EmbeddingT))//TODO this may be important
+#define shm_size (16384/sizeof(InputT))//TODO this may be important
 //#define shm_size (4096/sizeof(EmbeddingT))//TODO this may be important
 template <int ALIGNMENT = 3>
 __global__ void scatter_kernel_TMA(const InputT* input,
@@ -264,25 +264,30 @@ __global__ void scatter_kernel_TMA(const InputT* input,
 {
   auto grid = cooperative_groups::this_grid();
   auto block = cooperative_groups::this_thread_block();
-  extern __shared__ EmbeddingT shared[];
+  extern __shared__ InputT shared[];
   int embedding_size       = embedding_desc.dim;
   int64_t embedding_stride = embedding_desc.stride;
   int block_idx = block.group_index().x;
   int64_t input_stride     = input_desc.stride;
-  int batch_size = shm_size/input_stride;//indices batch size in lines
+  int batch_size = (shm_size-4)/input_stride;//indices batch size in lines
   typed_data_vector<EmbeddingT, ALIGNMENT> embeddings;
   typed_data_vector<InputT, ALIGNMENT> inputs;
+  int input_off_tail = input_desc.start_off%4;//this is crutial for copy alignment, 4 bytes as alignment;
   for (int64_t input_idx = block_idx*batch_size; input_idx < indice_count; input_idx += grid.num_blocks()*batch_size) {
 	  int cur_idx_lines = (indice_count - input_idx) > batch_size ? batch_size : indice_count - input_idx;
-	  const InputT* input_ptr = input + input_desc.start_off + input_stride * input_idx;
-	  cooperative_groups::memcpy_async(block, shared, (EmbeddingT*)(input_ptr), sizeof(EmbeddingT)*cur_idx_lines*input_stride);
+	  const InputT* input_ptr = input + input_desc.start_off - input_off_tail + input_stride * input_idx;
+    //this variable is also for alignment
+    int copy_size = (input_off_tail + cur_idx_lines*input_stride)*sizeof(InputT);
+    if (input_idx + cur_idx_lines < indice_count)//input_dim * sizeof(InputT) > 4 is needed
+      copy_size = (copy_size + 3)/4*4;
+	  cooperative_groups::memcpy_async(block, shared, input_ptr, copy_size);
 	  cooperative_groups::wait(block);
 	  for (int e = 0; e < cur_idx_lines; e ++) {
 		  int64_t embedding_table_idx = indices[input_idx + e];
 	  	EmbeddingT *emb_ptr = embedding + embedding_desc.start_off + embedding_table_idx*embedding_stride;
       
       for (int emb_idx = block.thread_rank() * ALIGNMENT; emb_idx < embedding_size; emb_idx += ALIGNMENT * block.size()) {
-        mov_data<sizeof(InputT) * ALIGNMENT>(&inputs, shared +e*input_stride + emb_idx);
+        mov_data<sizeof(InputT) * ALIGNMENT>(&inputs, shared + input_off_tail + e*input_stride + emb_idx);
 #pragma unroll
         for (int sub_idx = 0; sub_idx < ALIGNMENT; sub_idx++) {
           typed_data_vector_at(embeddings, sub_idx) =
@@ -501,7 +506,7 @@ int main (int argc, char**argv) {
                      input_dim : (input_dim/in_aligned_size+1)*in_aligned_size;
   int64_t in_malloc_size = (int64_t)in_stride * input_size + input_start_off;
   CUDA_TRY(cudaMalloc((void **)&input, sizeof(InputT)*in_malloc_size));
-  printf("the input stride is %d, the input_malloc_size is %ld\n", in_stride, in_malloc_size);
+  printf("the input stride is %d, the input_malloc_size is %ld, ptr is 0x%p\n", in_stride, in_malloc_size, input);
 
   thrust::sequence(thrust::device, input+input_start_off, input+in_malloc_size, 0);//NOTE: more initialization methods needed
   thrust::reverse(thrust::device, input+input_start_off, input+in_malloc_size);
@@ -514,8 +519,9 @@ int main (int argc, char**argv) {
   int emb_stride = embedding_dim % emb_aligned_size == 0 ? 
                      embedding_dim : (embedding_dim/emb_aligned_size+1)*emb_aligned_size;
   int64_t emb_malloc_size = (int64_t)emb_stride * embedding_size + emb_start_off;
-  printf("the emb stride is %d, the emb_malloc_size is %ld\n", emb_stride, emb_malloc_size);
   CUDA_TRY(cudaMalloc((void **)&embedding, sizeof(EmbeddingT)*emb_malloc_size));
+  printf("the emb stride is %d, the emb_malloc_size is %ld, the ptr is 0x%p\n", emb_stride, emb_malloc_size, embedding);
+
   thrust::sequence(thrust::device, embedding+emb_start_off, embedding+emb_malloc_size, 0);
   struct desc emb_desc = desc(embedding_size, embedding_dim, emb_stride, emb_start_off);
   printf("construct the target embedding done, the emb_stride is %d\n", emb_stride);
