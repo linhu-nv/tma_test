@@ -18,8 +18,8 @@ using namespace std;
 #define TMA_PIPELINE_COPY
 //#define USE_BARRIER
 
-typedef uint8_t InputT;
-typedef uint8_t EmbeddingT;
+typedef uint32_t InputT;
+typedef uint32_t EmbeddingT;
 typedef int IndexT;
 struct desc{
   int size;
@@ -253,6 +253,7 @@ __global__ void scatter_func_kernel(const InputT* input,
 }
 
 #define shm_size (16384/sizeof(EmbeddingT))//TODO this may be important
+//#define shm_size (4096/sizeof(EmbeddingT))//TODO this may be important
 template <int ALIGNMENT = 3>
 __global__ void scatter_kernel_TMA(const InputT* input,
                                     desc input_desc,
@@ -336,10 +337,10 @@ __global__ void scatter_kernel_TMA_pipeline(const InputT* input,
       int64_t emb_idx = indices[input_idx+e];
       EmbeddingT* out_addr = embedding + emb_desc.start_off + emb_desc.stride*emb_idx;
       int shared_off = (put_batch % stage_count)* batch_size*input_stride;
-      for (int emb_idx = block.thread_rank(); emb_idx < emb_desc.dim; emb_idx += block.size()) {
+      /*for (int emb_idx = block.thread_rank(); emb_idx < emb_desc.dim; emb_idx += block.size()) {
         out_addr[emb_idx] = shared[shared_off+e*input_stride+emb_idx];
-      }
-      /*for (int emb_idx = block.thread_rank() * ALIGNMENT; emb_idx < emb_desc.dim; emb_idx += ALIGNMENT * block.size()) {
+      }*/
+      for (int emb_idx = block.thread_rank() * ALIGNMENT; emb_idx < emb_desc.dim; emb_idx += ALIGNMENT * block.size()) {
         mov_data<sizeof(InputT) * ALIGNMENT>(&inputs, shared + shared_off + e*input_stride + emb_idx);
 #pragma unroll
         for (int sub_idx = 0; sub_idx < ALIGNMENT; sub_idx++) {
@@ -347,7 +348,7 @@ __global__ void scatter_kernel_TMA_pipeline(const InputT* input,
             convert_type<InputT, EmbeddingT>(typed_data_vector_at(inputs, sub_idx));
         }
         mov_data<sizeof(EmbeddingT) * ALIGNMENT>(out_addr + emb_idx, &embeddings);
-      }*/
+      }
     }
     //block.sync();
     pipeline.consumer_release();
@@ -491,13 +492,17 @@ int main (int argc, char**argv) {
   uint64_t embedding_size = 10 * 1024UL * 1024UL;
   uint64_t input_size = 5 * 1024UL * 1024UL;
 
+  uint64_t total_size_gb = (embedding_size + input_size)*embedding_dim*sizeof(EmbeddingT)/1024/1024/1024;
+  printf("the total size is %d GB\n", total_size_gb);
   //construct input
   InputT *input;
   int in_aligned_size = 16/sizeof(InputT);
   int in_stride = input_dim % in_aligned_size == 0 ? 
                      input_dim : (input_dim/in_aligned_size+1)*in_aligned_size;
-  int in_malloc_size = in_stride * input_size + input_start_off;
+  int64_t in_malloc_size = (int64_t)in_stride * input_size + input_start_off;
   CUDA_TRY(cudaMalloc((void **)&input, sizeof(InputT)*in_malloc_size));
+  printf("the input stride is %d, the input_malloc_size is %ld\n", in_stride, in_malloc_size);
+
   thrust::sequence(thrust::device, input+input_start_off, input+in_malloc_size, 0);//NOTE: more initialization methods needed
   thrust::reverse(thrust::device, input+input_start_off, input+in_malloc_size);
   struct desc input_desc = desc(input_size, input_dim, in_stride, input_start_off);
@@ -508,7 +513,8 @@ int main (int argc, char**argv) {
   int emb_aligned_size = 16/sizeof(EmbeddingT);
   int emb_stride = embedding_dim % emb_aligned_size == 0 ? 
                      embedding_dim : (embedding_dim/emb_aligned_size+1)*emb_aligned_size;
-  int emb_malloc_size = emb_stride * embedding_size + emb_start_off;
+  int64_t emb_malloc_size = (int64_t)emb_stride * embedding_size + emb_start_off;
+  printf("the emb stride is %d, the emb_malloc_size is %ld\n", emb_stride, emb_malloc_size);
   CUDA_TRY(cudaMalloc((void **)&embedding, sizeof(EmbeddingT)*emb_malloc_size));
   thrust::sequence(thrust::device, embedding+emb_start_off, embedding+emb_malloc_size, 0);
   struct desc emb_desc = desc(embedding_size, embedding_dim, emb_stride, emb_start_off);
