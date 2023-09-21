@@ -12,19 +12,24 @@
 #include <cuda/pipeline>
 
 using namespace std;
-//#define SCATTER
-#define GATHER
+
+#define SCATTER
+//#define GATHER
 
 #ifdef SCATTER
 //#define QUICK_VALIDATION_SCATTER
 #endif
 #ifdef GATHER
-#define QUICK_VALIDATION_GATHER
+//#define QUICK_VALIDATION_GATHER
 #endif
 
 //#define NAIVE_COPY
 #define TMA_COPY
 //#define TMA_PIPELINE_COPY
+
+//#define shm_size (4096/sizeof(InputT))//TODO this may be important
+//#define shm_size (24576/sizeof(InputT))
+#define shm_size (49152/sizeof(InputT))
 
 typedef uint32_t InputT;
 typedef uint32_t OutputT;
@@ -261,9 +266,6 @@ __global__ void scatter_func_kernel(const InputT* input,
   }
 }
 
-//#define shm_size (16384/sizeof(InputT))//TODO this may be important
-//#define shm_size (24576/sizeof(InputT))
-#define shm_size (49152/sizeof(InputT))
 template <int ALIGNMENT = 3>
 __global__ void scatter_kernel_TMA(const InputT* input,
                                     desc input_desc,
@@ -699,7 +701,7 @@ int main (int argc, char**argv) {
 
   uint64_t total_size_gb = (embedding_size + input_size)*embedding_dim*sizeof(EmbeddingT)/1024/1024/1024;
   printf("the total size is %d GB\n", total_size_gb);
-#ifdef SCATTERT
+#ifdef SCATTER
   //construct input
   InputT *input;
   int in_aligned_size = 16/sizeof(InputT);
