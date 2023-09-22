@@ -13,8 +13,8 @@
 
 using namespace std;
 
-#define SCATTER
-//#define GATHER
+//#define SCATTER
+#define GATHER
 
 #ifdef SCATTER
 //#define QUICK_VALIDATION_SCATTER
@@ -27,13 +27,13 @@ using namespace std;
 #define TMA_COPY
 //#define TMA_PIPELINE_COPY
 
-//#define shm_size (4096/sizeof(InputT))//TODO this may be important
+#define shm_size (16384/sizeof(InputT))//TODO this may be important
 //#define shm_size (24576/sizeof(InputT))
-#define shm_size (49152/sizeof(InputT))
+//#define shm_size (49152/sizeof(InputT))
 
-typedef uint32_t InputT;
-typedef uint32_t OutputT;
-typedef uint32_t EmbeddingT;
+typedef uint8_t InputT;
+typedef uint8_t OutputT;
+typedef uint8_t EmbeddingT;
 typedef int IndexT;
 struct desc{
   int size;
@@ -542,42 +542,47 @@ __global__ void gather_func_kernel_TMA(EmbeddingT* embedding,
                                    desc output_desc)
 {
   auto block = cooperative_groups::this_thread_block();
+  auto mywarp = cooperative_groups::tiled_partition<32>(block);
   extern __shared__ EmbeddingT shared[];
+  EmbeddingT* my_shared = shared + shm_size/(blockDim.x/32)*(threadIdx.x/32);
+  int warp_id = (threadIdx.x + blockIdx.x * blockDim.x)/32;
+  int lane_id = threadIdx.x % 32;
+
   int embedding_size       = embedding_desc.dim;
   int64_t embedding_stride = embedding_desc.stride;
   int block_idx = block.group_index().x;
   int64_t output_stride     = output_desc.stride;
   //int async_copy_align = 4;
-  int batch_size = shm_size/output_stride;//indices batch size for a block in lines
+  int batch_size = shm_size/(blockDim.x/32)/output_stride;//indices batch size for a block in lines
   
   typed_data_vector<EmbeddingT, ALIGNMENT> embeddings;
   typed_data_vector<OutputT, ALIGNMENT> outputs;
   //int output_off_tail = output_desc.storage_offset%async_copy_align;//this is crutial for copy alignment, 4 bytes as alignment;
   
-  for (int64_t output_idx = block_idx*batch_size; output_idx < indice_count; output_idx += gridDim.x*batch_size) {
+  for (int64_t output_idx = warp_id*batch_size; output_idx < indice_count; output_idx += gridDim.x*(blockDim.x/32)*batch_size) {
 	  int cur_idx_lines = (indice_count - output_idx) > batch_size ? batch_size : indice_count - output_idx;
     for (int e = 0; e < cur_idx_lines; e ++) {
 		  int64_t embedding_table_idx = indices[output_idx + e];
 	  	EmbeddingT *emb_ptr = embedding + embedding_desc.start_off + embedding_table_idx*embedding_stride;
       
-      for (int emb_idx = block.thread_rank() * ALIGNMENT; emb_idx < embedding_size; emb_idx += ALIGNMENT * block.size()) {
+      for (int emb_idx = lane_id * ALIGNMENT; emb_idx < embedding_size; emb_idx += ALIGNMENT * 32) {
         mov_data<sizeof(EmbeddingT) * ALIGNMENT>(&embeddings, emb_ptr + emb_idx);
 #pragma unroll
         for (int sub_idx = 0; sub_idx < ALIGNMENT; sub_idx++) {
           typed_data_vector_at(outputs, sub_idx) =
             convert_type<EmbeddingT, OutputT>(typed_data_vector_at(embeddings, sub_idx));
         }
-        mov_data<sizeof(InputT) * ALIGNMENT>(shared + e*output_stride + emb_idx, &outputs);
+        mov_data<sizeof(InputT) * ALIGNMENT>(my_shared + e*output_stride + emb_idx, &outputs);
       }
 	  }
-    block.sync();
+    //block.sync();
     OutputT* output_ptr = output + output_desc.start_off + output_stride * output_idx;
     //this variable is also for alignment
     int copy_size = cur_idx_lines*output_stride*sizeof(OutputT);
     //if (input_idx + cur_idx_lines < indice_count)//input_dim * sizeof(InputT) > 4 is needed
     //  copy_size = (copy_size + async_copy_align - 1)/async_copy_align*async_copy_align;
-	  cooperative_groups::memcpy_async(block, output_ptr, shared, copy_size);
-	  cooperative_groups::wait(block); 
+	  cooperative_groups::memcpy_async(mywarp, output_ptr, my_shared, copy_size);
+	  cooperative_groups::wait(mywarp); 
   }
   return;
 }
@@ -628,8 +633,9 @@ void gather_temp_func(EmbeddingT *embedding,
 #endif
 #ifdef TMA_COPY
   int thread_num = (embedding_size+alignment-1)/ alignment;
-  thread_num = std::min(thread_num, 512);
-  int64_t block_count = indice_count >= 1024 ? 1024 : static_cast<int>(indice_count);
+  //thread_num = std::min(thread_num, 512);
+  thread_num = 256;
+  int64_t block_count = indice_count >= 2048 ? 2048 : static_cast<int>(indice_count);
   
   void (*kernel_fn)(EmbeddingT*,
                     desc,
