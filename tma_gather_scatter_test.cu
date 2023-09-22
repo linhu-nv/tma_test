@@ -13,14 +13,14 @@
 
 using namespace std;
 
-//#define SCATTER
-#define GATHER
+#define SCATTER
+//#define GATHER
 
 #ifdef SCATTER
 //#define QUICK_VALIDATION_SCATTER
 #endif
 #ifdef GATHER
-//#define QUICK_VALIDATION_GATHER
+#define QUICK_VALIDATION_GATHER
 #endif
 
 //#define NAIVE_COPY
@@ -274,33 +274,37 @@ __global__ void scatter_kernel_TMA(const InputT* input,
                                     EmbeddingT* embedding,
                                     desc embedding_desc)
 {
-  auto grid = cooperative_groups::this_grid();
   auto block = cooperative_groups::this_thread_block();
+  auto mywarp = cooperative_groups::tiled_partition<32>(block);
   extern __shared__ InputT shared[];
+  InputT* my_shared = shared + shm_size/(blockDim.x/32)*(threadIdx.x/32);
+  int warp_id = (threadIdx.x + blockIdx.x * blockDim.x)/32;
+  int lane_id = threadIdx.x % 32;
+
   int embedding_size       = embedding_desc.dim;
   int64_t embedding_stride = embedding_desc.stride;
   int block_idx = block.group_index().x;
   int64_t input_stride     = input_desc.stride;
   int async_copy_align = 4;
-  int batch_size = (shm_size-async_copy_align)/input_stride;//indices batch size in lines
+  int batch_size = (shm_size/(blockDim.x/32)-async_copy_align)/input_stride;//indices batch size in lines
   typed_data_vector<EmbeddingT, ALIGNMENT> embeddings;
   typed_data_vector<InputT, ALIGNMENT> inputs;
   int input_off_tail = input_desc.start_off%async_copy_align;//this is crutial for copy alignment, 4 bytes as alignment;
-  for (int64_t input_idx = block_idx*batch_size; input_idx < indice_count; input_idx += grid.num_blocks()*batch_size) {
+  for (int64_t input_idx = warp_id*batch_size; input_idx < indice_count; input_idx += gridDim.x*(blockDim.x/32)*batch_size) {
 	  int cur_idx_lines = (indice_count - input_idx) > batch_size ? batch_size : indice_count - input_idx;
 	  const InputT* input_ptr = input + input_desc.start_off - input_off_tail + input_stride * input_idx;
     //this variable is also for alignment
     int copy_size = (input_off_tail + cur_idx_lines*input_stride)*sizeof(InputT);
     if (input_idx + cur_idx_lines < indice_count)//input_dim * sizeof(InputT) > 4 is needed
       copy_size = (copy_size + async_copy_align -1)/async_copy_align*async_copy_align;
-	  cooperative_groups::memcpy_async(block, shared, input_ptr, copy_size);
-	  cooperative_groups::wait(block);
+	  cooperative_groups::memcpy_async(mywarp, my_shared, input_ptr, copy_size);
+	  cooperative_groups::wait(mywarp);
 	  for (int e = 0; e < cur_idx_lines; e ++) {
 		  int64_t embedding_table_idx = indices[input_idx + e];
 	  	EmbeddingT *emb_ptr = embedding + embedding_desc.start_off + embedding_table_idx*embedding_stride;
       
-      for (int emb_idx = block.thread_rank() * ALIGNMENT; emb_idx < embedding_size; emb_idx += ALIGNMENT * block.size()) {
-        mov_data<sizeof(InputT) * ALIGNMENT>(&inputs, shared + input_off_tail + e*input_stride + emb_idx);
+      for (int emb_idx = lane_id * ALIGNMENT; emb_idx < embedding_size; emb_idx += ALIGNMENT * 32) {
+        mov_data<sizeof(InputT) * ALIGNMENT>(&inputs, my_shared + input_off_tail + e*input_stride + emb_idx);
 #pragma unroll
         for (int sub_idx = 0; sub_idx < ALIGNMENT; sub_idx++) {
           typed_data_vector_at(embeddings, sub_idx) =
@@ -309,7 +313,7 @@ __global__ void scatter_kernel_TMA(const InputT* input,
         mov_data<sizeof(EmbeddingT) * ALIGNMENT>(emb_ptr + emb_idx, &embeddings);
       }
 	  }
-    block.sync();
+    mywarp.sync();
   }
   return ;
 }
@@ -454,8 +458,9 @@ void scatter_temp_func(InputT* input,
     }
   }
   int block_size = (embedding_desc.dim + alignment-1)/alignment;
-  block_size = block_size > 512 ? 512 : block_size;
-  int block_count = indice_count > 1024 ? 1024 : indice_count;
+  //block_size = block_size > 512 ? 512 : block_size;
+  block_size = 256;
+  int block_count = indice_count > 2048 ? 2048 : indice_count;
   kernel_fn<<<block_count, block_size, shm_size*sizeof(InputT)>>>(input,
                                                                           input_desc,
                                                                           indices,
