@@ -13,11 +13,11 @@
 
 using namespace std;
 
-#define SCATTER
-//#define GATHER
+//#define SCATTER
+#define GATHER
 
 #ifdef SCATTER
-//#define QUICK_VALIDATION_SCATTER
+#define QUICK_VALIDATION_SCATTER
 #endif
 #ifdef GATHER
 #define QUICK_VALIDATION_GATHER
@@ -31,9 +31,9 @@ using namespace std;
 //#define shm_size (24576/sizeof(InputT))
 //#define shm_size (49152/sizeof(InputT))
 
-typedef uint8_t InputT;
-typedef uint8_t OutputT;
-typedef uint8_t EmbeddingT;
+typedef uint32_t InputT;
+typedef uint32_t OutputT;
+typedef uint32_t EmbeddingT;
 typedef int IndexT;
 struct desc{
   int size;
@@ -277,7 +277,7 @@ __global__ void scatter_kernel_TMA(const InputT* input,
   auto block = cooperative_groups::this_thread_block();
   auto mywarp = cooperative_groups::tiled_partition<32>(block);
   extern __shared__ InputT shared[];
-  InputT* my_shared = shared + shm_size/(blockDim.x/32)*(threadIdx.x/32);
+  InputT* my_shared;
   int warp_id = (threadIdx.x + blockIdx.x * blockDim.x)/32;
   int lane_id = threadIdx.x % 32;
 
@@ -290,21 +290,30 @@ __global__ void scatter_kernel_TMA(const InputT* input,
   typed_data_vector<EmbeddingT, ALIGNMENT> embeddings;
   typed_data_vector<InputT, ALIGNMENT> inputs;
   int input_off_tail = input_desc.start_off%async_copy_align;//this is crutial for copy alignment, 4 bytes as alignment;
+  bool use_shm = true;
+  if (batch_size <= 0) { 
+    use_shm = false; batch_size = 1;
+  }else {
+    my_shared = shared + shm_size/(blockDim.x/32)*(threadIdx.x/32);
+  }
   for (int64_t input_idx = warp_id*batch_size; input_idx < indice_count; input_idx += gridDim.x*(blockDim.x/32)*batch_size) {
 	  int cur_idx_lines = (indice_count - input_idx) > batch_size ? batch_size : indice_count - input_idx;
 	  const InputT* input_ptr = input + input_desc.start_off - input_off_tail + input_stride * input_idx;
     //this variable is also for alignment
-    int copy_size = (input_off_tail + cur_idx_lines*input_stride)*sizeof(InputT);
-    if (input_idx + cur_idx_lines < indice_count)//input_dim * sizeof(InputT) > 4 is needed
-      copy_size = (copy_size + async_copy_align -1)/async_copy_align*async_copy_align;
-	  cooperative_groups::memcpy_async(mywarp, my_shared, input_ptr, copy_size);
-	  cooperative_groups::wait(mywarp);
+    if (use_shm) {
+      int copy_size = (input_off_tail + cur_idx_lines*input_stride)*sizeof(InputT);
+      if (input_idx + cur_idx_lines < indice_count)//input_dim * sizeof(InputT) > 4 is needed
+        copy_size = (copy_size + async_copy_align -1)/async_copy_align*async_copy_align;
+	    cooperative_groups::memcpy_async(mywarp, my_shared, input_ptr, copy_size);
+	    cooperative_groups::wait(mywarp);
+    }
 	  for (int e = 0; e < cur_idx_lines; e ++) {
 		  int64_t embedding_table_idx = indices[input_idx + e];
 	  	EmbeddingT *emb_ptr = embedding + embedding_desc.start_off + embedding_table_idx*embedding_stride;
       
       for (int emb_idx = lane_id * ALIGNMENT; emb_idx < embedding_size; emb_idx += ALIGNMENT * 32) {
-        mov_data<sizeof(InputT) * ALIGNMENT>(&inputs, my_shared + input_off_tail + e*input_stride + emb_idx);
+        if (use_shm) mov_data<sizeof(InputT) * ALIGNMENT>(&inputs, my_shared + input_off_tail + e*input_stride + emb_idx);
+        else mov_data<sizeof(InputT) * ALIGNMENT>(&inputs, input_ptr + input_off_tail + e*input_stride + emb_idx);
 #pragma unroll
         for (int sub_idx = 0; sub_idx < ALIGNMENT; sub_idx++) {
           typed_data_vector_at(embeddings, sub_idx) =
@@ -548,8 +557,8 @@ __global__ void gather_func_kernel_TMA(EmbeddingT* embedding,
 {
   auto block = cooperative_groups::this_thread_block();
   auto mywarp = cooperative_groups::tiled_partition<32>(block);
-  extern __shared__ EmbeddingT shared[];
-  EmbeddingT* my_shared = shared + shm_size/(blockDim.x/32)*(threadIdx.x/32);
+  extern __shared__ OutputT shared[];
+  OutputT* my_shared; 
   int warp_id = (threadIdx.x + blockIdx.x * blockDim.x)/32;
   int lane_id = threadIdx.x % 32;
 
@@ -562,10 +571,22 @@ __global__ void gather_func_kernel_TMA(EmbeddingT* embedding,
   
   typed_data_vector<EmbeddingT, ALIGNMENT> embeddings;
   typed_data_vector<OutputT, ALIGNMENT> outputs;
+
+  bool use_shm = true;
+  if (batch_size <= 0) {
+    use_shm = false;
+    batch_size = 1;
+  } else {
+    my_shared = shared + shm_size/(blockDim.x/32)*(threadIdx.x/32);
+  }
   //int output_off_tail = output_desc.storage_offset%async_copy_align;//this is crutial for copy alignment, 4 bytes as alignment;
   
   for (int64_t output_idx = warp_id*batch_size; output_idx < indice_count; output_idx += gridDim.x*(blockDim.x/32)*batch_size) {
 	  int cur_idx_lines = (indice_count - output_idx) > batch_size ? batch_size : indice_count - output_idx;
+    OutputT* output_ptr = output + output_desc.start_off + output_stride * output_idx;
+    if (!use_shm) {
+      my_shared = output_ptr;
+    }
     for (int e = 0; e < cur_idx_lines; e ++) {
 		  int64_t embedding_table_idx = indices[output_idx + e];
 	  	EmbeddingT *emb_ptr = embedding + embedding_desc.start_off + embedding_table_idx*embedding_stride;
@@ -581,13 +602,14 @@ __global__ void gather_func_kernel_TMA(EmbeddingT* embedding,
       }
 	  }
     //block.sync();
-    OutputT* output_ptr = output + output_desc.start_off + output_stride * output_idx;
-    //this variable is also for alignment
-    int copy_size = cur_idx_lines*output_stride*sizeof(OutputT);
-    //if (input_idx + cur_idx_lines < indice_count)//input_dim * sizeof(InputT) > 4 is needed
-    //  copy_size = (copy_size + async_copy_align - 1)/async_copy_align*async_copy_align;
-	  cooperative_groups::memcpy_async(mywarp, output_ptr, my_shared, copy_size);
-	  cooperative_groups::wait(mywarp); 
+    if (use_shm) {
+      //this variable is also for alignment
+      int copy_size = cur_idx_lines*output_stride*sizeof(OutputT);
+      //if (input_idx + cur_idx_lines < indice_count)//input_dim * sizeof(InputT) > 4 is needed
+      //  copy_size = (copy_size + async_copy_align - 1)/async_copy_align*async_copy_align;
+	    cooperative_groups::memcpy_async(mywarp, output_ptr, my_shared, copy_size);
+	    cooperative_groups::wait(mywarp);
+    } 
   }
   return;
 }
