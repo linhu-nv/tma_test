@@ -13,28 +13,30 @@
 
 using namespace std;
 
-//#define SCATTER
-#define GATHER
+typedef uint32_t InputT;
+typedef uint32_t OutputT;
+typedef uint32_t EmbeddingT;
+typedef int IndexT;
+
+#define SCATTER
+//#define GATHER
 
 #ifdef SCATTER
-#define QUICK_VALIDATION_SCATTER
+//#define QUICK_VALIDATION_SCATTER
+#define shm_size (24576/sizeof(InputT))//this setting assure best performance for 1024xint feature
 #endif
 #ifdef GATHER
-#define QUICK_VALIDATION_GATHER
+//#define QUICK_VALIDATION_GATHER
+#define shm_size (16384/sizeof(InputT))//TODO this may be important, can be fine-tuned
+                                       //in our experiments, less shm size may be better
 #endif
 
 //#define NAIVE_COPY
 #define TMA_COPY
 //#define TMA_PIPELINE_COPY
 
-#define shm_size (16384/sizeof(InputT))//TODO this may be important
-//#define shm_size (24576/sizeof(InputT))
 //#define shm_size (49152/sizeof(InputT))
 
-typedef uint32_t InputT;
-typedef uint32_t OutputT;
-typedef uint32_t EmbeddingT;
-typedef int IndexT;
 struct desc{
   int size;
   int dim;
@@ -266,6 +268,23 @@ __global__ void scatter_func_kernel(const InputT* input,
   }
 }
 
+__inline__ __device__
+void cp_async_bulk_global_to_shared(void *__dest, const void *__src, _CUDA_VSTD::uint32_t __size, ::cuda::barrier<::cuda::thread_scope_block> &__bar)
+{
+    assert(__size % 16 == 0);
+    assert(__isShared(__dest));
+    assert(__isGlobal(__src));
+
+    asm volatile(
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
+        :
+        : "r"(static_cast<_CUDA_VSTD::uint32_t>(__cvta_generic_to_shared(__dest))),
+          "l"(static_cast<_CUDA_VSTD::uint64_t>(__cvta_generic_to_global(__src))),
+          "r"(__size),
+          "r"(static_cast<_CUDA_VSTD::uint32_t>(__cvta_generic_to_shared(::cuda::device::barrier_native_handle(__bar))))
+        : "memory");
+}
+
 template <int ALIGNMENT = 3>
 __global__ void scatter_kernel_TMA(const InputT* input,
                                     desc input_desc,
@@ -274,6 +293,7 @@ __global__ void scatter_kernel_TMA(const InputT* input,
                                     EmbeddingT* embedding,
                                     desc embedding_desc)
 {
+  
   auto block = cooperative_groups::this_thread_block();
   auto mywarp = cooperative_groups::tiled_partition<32>(block);
   extern __shared__ InputT shared[];
@@ -281,11 +301,18 @@ __global__ void scatter_kernel_TMA(const InputT* input,
   int warp_id = (threadIdx.x + blockIdx.x * blockDim.x)/32;
   int lane_id = threadIdx.x % 32;
 
+  using barrier = cuda::barrier<cuda::thread_scope_block>;
+  __shared__ barrier bar;
+  if (threadIdx.x == 0) {
+    init(&bar, blockDim.x);
+  }
+  block.sync();
+
   int embedding_size       = embedding_desc.dim;
   int64_t embedding_stride = embedding_desc.stride;
   int block_idx = block.group_index().x;
   int64_t input_stride     = input_desc.stride;
-  int async_copy_align = 4;
+  int async_copy_align = 16;
   int batch_size = (shm_size/(blockDim.x/32)-async_copy_align)/input_stride;//indices batch size in lines
   typed_data_vector<EmbeddingT, ALIGNMENT> embeddings;
   typed_data_vector<InputT, ALIGNMENT> inputs;
@@ -304,8 +331,10 @@ __global__ void scatter_kernel_TMA(const InputT* input,
       int copy_size = (input_off_tail + cur_idx_lines*input_stride)*sizeof(InputT);
       if (input_idx + cur_idx_lines < indice_count)//input_dim * sizeof(InputT) > 4 is needed
         copy_size = (copy_size + async_copy_align -1)/async_copy_align*async_copy_align;
-	    cooperative_groups::memcpy_async(mywarp, my_shared, input_ptr, copy_size);
-	    cooperative_groups::wait(mywarp);
+      cp_async_bulk_global_to_shared((void *)my_shared, (void *)input_ptr, copy_size, bar);
+	    //cooperative_groups::memcpy_async(mywarp, my_shared, input_ptr, copy_size);
+	    //cooperative_groups::wait(mywarp);
+
     }
 	  for (int e = 0; e < cur_idx_lines; e ++) {
 		  int64_t embedding_table_idx = indices[input_idx + e];
