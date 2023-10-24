@@ -314,18 +314,20 @@ __global__ void scatter_kernel_TMA(const InputT* input,
     //this variable is also for alignment
     if (use_shm) {
       int copy_size = (input_off_tail + cur_idx_lines*input_stride)*sizeof(InputT);
-      if (input_idx + cur_idx_lines < indice_count)//input_dim * sizeof(InputT) > 4 is needed
+      if (input_idx + cur_idx_lines < indice_count) {//input_dim * sizeof(InputT) > 4 is needed
         copy_size = (copy_size + async_copy_align -1)/async_copy_align*async_copy_align;
-      uint64_t token;
-      if (threadIdx.x == 0) {
-        cp_async_bulk_global_to_shared((void *)my_shared, (void *)input_ptr, copy_size, bar);
-        token = barrier_arrive_tx(bar, copy_size);
+        uint64_t token;
+        if (threadIdx.x == 0) {
+          cp_async_bulk_global_to_shared((void *)my_shared, (void *)input_ptr, copy_size, bar);
+          token = barrier_arrive_tx(bar, copy_size);
+        } else {
+          token = bar.arrive();
+        }
+        bar.wait(cuda::std::move(token));
       } else {
-        token = bar.arrive();
+	      cooperative_groups::memcpy_async(mywarp, my_shared, input_ptr, copy_size);
+	      cooperative_groups::wait(mywarp);
       }
-      bar.wait(cuda::std::move(token));
-	    //cooperative_groups::memcpy_async(mywarp, my_shared, input_ptr, copy_size);
-	    //cooperative_groups::wait(mywarp);
     }
 	  for (int e = 0; e < cur_idx_lines; e ++) {
 		  int64_t embedding_table_idx = indices[input_idx + e];
