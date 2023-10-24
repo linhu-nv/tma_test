@@ -1,4 +1,3 @@
-#include <stdlib.h>
 #include <random>
 
 #include <cuda_runtime.h>
@@ -8,8 +7,10 @@
 #include <thrust/sort.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/memcpy_async.h>
-#include <cuda/barrier>
+//#include <cuda/barrier>
 #include <cuda/pipeline>
+
+#include "tma_gather_scatter_test.cuh"
 
 using namespace std;
 
@@ -17,6 +18,8 @@ typedef uint32_t InputT;
 typedef uint32_t OutputT;
 typedef uint32_t EmbeddingT;
 typedef int IndexT;
+
+using barrier = cuda::barrier<cuda::thread_scope_block>;
 
 #define SCATTER
 //#define GATHER
@@ -268,23 +271,6 @@ __global__ void scatter_func_kernel(const InputT* input,
   }
 }
 
-__inline__ __device__
-void cp_async_bulk_global_to_shared(void *__dest, const void *__src, _CUDA_VSTD::uint32_t __size, ::cuda::barrier<::cuda::thread_scope_block> &__bar)
-{
-    assert(__size % 16 == 0);
-    assert(__isShared(__dest));
-    assert(__isGlobal(__src));
-
-    asm volatile(
-        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
-        :
-        : "r"(static_cast<_CUDA_VSTD::uint32_t>(__cvta_generic_to_shared(__dest))),
-          "l"(static_cast<_CUDA_VSTD::uint64_t>(__cvta_generic_to_global(__src))),
-          "r"(__size),
-          "r"(static_cast<_CUDA_VSTD::uint32_t>(__cvta_generic_to_shared(::cuda::device::barrier_native_handle(__bar))))
-        : "memory");
-}
-
 template <int ALIGNMENT = 3>
 __global__ void scatter_kernel_TMA(const InputT* input,
                                     desc input_desc,
@@ -301,7 +287,6 @@ __global__ void scatter_kernel_TMA(const InputT* input,
   int warp_id = (threadIdx.x + blockIdx.x * blockDim.x)/32;
   int lane_id = threadIdx.x % 32;
 
-  using barrier = cuda::barrier<cuda::thread_scope_block>;
   __shared__ barrier bar;
   if (threadIdx.x == 0) {
     init(&bar, blockDim.x);
@@ -331,10 +316,16 @@ __global__ void scatter_kernel_TMA(const InputT* input,
       int copy_size = (input_off_tail + cur_idx_lines*input_stride)*sizeof(InputT);
       if (input_idx + cur_idx_lines < indice_count)//input_dim * sizeof(InputT) > 4 is needed
         copy_size = (copy_size + async_copy_align -1)/async_copy_align*async_copy_align;
-      cp_async_bulk_global_to_shared((void *)my_shared, (void *)input_ptr, copy_size, bar);
+      uint64_t token;
+      if (threadIdx.x == 0) {
+        cp_async_bulk_global_to_shared((void *)my_shared, (void *)input_ptr, copy_size, bar);
+        token = barrier_arrive_tx(bar, copy_size);
+      } else {
+        token = bar.arrive();
+      }
+      bar.wait(cuda::std::move(token));
 	    //cooperative_groups::memcpy_async(mywarp, my_shared, input_ptr, copy_size);
 	    //cooperative_groups::wait(mywarp);
-
     }
 	  for (int e = 0; e < cur_idx_lines; e ++) {
 		  int64_t embedding_table_idx = indices[input_idx + e];
@@ -497,7 +488,7 @@ void scatter_temp_func(InputT* input,
   }
   int block_size = (embedding_desc.dim + alignment-1)/alignment;
   //block_size = block_size > 512 ? 512 : block_size;
-  block_size = 256;
+  block_size = 32;
   int block_count = indice_count > 2048 ? 2048 : indice_count;
   kernel_fn<<<block_count, block_size, shm_size*sizeof(InputT)>>>(input,
                                                                           input_desc,
