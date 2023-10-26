@@ -13,24 +13,6 @@
 
 using namespace std;
 
-//#define SCATTER
-#define GATHER
-
-#ifdef SCATTER
-#define QUICK_VALIDATION_SCATTER
-#endif
-#ifdef GATHER
-#define QUICK_VALIDATION_GATHER
-#endif
-
-//#define NAIVE_COPY
-#define TMA_COPY
-//#define TMA_PIPELINE_COPY
-
-#define shm_size (16384/sizeof(InputT))//TODO this may be important
-//#define shm_size (24576/sizeof(InputT))
-//#define shm_size (49152/sizeof(InputT))
-
 typedef uint32_t InputT;
 typedef uint32_t OutputT;
 typedef uint32_t EmbeddingT;
@@ -43,6 +25,26 @@ struct desc{
   desc(int _s, int _d, int _stride, int _startoff):
         size(_s), dim(_d), stride(_stride), start_off(_startoff){}
 };
+
+#define SCATTER
+//#define GATHER
+
+#ifdef SCATTER
+#define QUICK_VALIDATION_SCATTER
+#define shm_size (24576/sizeof(InputT))
+#endif
+#ifdef GATHER
+#define QUICK_VALIDATION_GATHER
+#define shm_size (16384/sizeof(InputT))//TODO this may be important
+#endif
+
+//#define NAIVE_COPY
+#define TMA_COPY
+//#define TMA_PIPELINE_COPY
+
+//#define shm_size (49152/sizeof(InputT))
+
+
 
 #define CUDA_TRY(call)                                                          \
   do {                                                                          \
@@ -401,7 +403,7 @@ void scatter_temp_func(InputT* input,
   int wm_alignment   = determine_wholememory_alignment_elt_count(embedding_desc);
   int mm_alignment   = determine_memory_alignment_elt_count(input, input_desc);
   int alignment      = std::min<int>(wm_alignment, mm_alignment);
-  int embedding_size = embedding_desc.dim;
+  //int embedding_size = embedding_desc.dim;
 #ifdef NAIVE_COPY
   int thread_x       = (embedding_size + alignment-1)/alignment;
   thread_x           = std::min(thread_x, 256);
@@ -564,49 +566,41 @@ __global__ void gather_func_kernel_TMA(EmbeddingT* embedding,
 
   int embedding_size       = embedding_desc.dim;
   int64_t embedding_stride = embedding_desc.stride;
-  int block_idx = block.group_index().x;
+  //int block_idx = block.group_index().x;
   int64_t output_stride     = output_desc.stride;
   //int async_copy_align = 4;
-  int batch_size = shm_size/(blockDim.x/32)/output_stride;//indices batch size for a block in lines
   
   typed_data_vector<EmbeddingT, ALIGNMENT> embeddings;
   typed_data_vector<OutputT, ALIGNMENT> outputs;
 
   bool use_shm = true;
-  if (batch_size <= 0) {
+  if (shm_size/(blockDim.x/32) < output_desc.dim) {
     use_shm = false;
-    batch_size = 1;
   } else {
     my_shared = shared + shm_size/(blockDim.x/32)*(threadIdx.x/32);
   }
-  //int output_off_tail = output_desc.storage_offset%async_copy_align;//this is crutial for copy alignment, 4 bytes as alignment;
   
-  for (int64_t output_idx = warp_id*batch_size; output_idx < indice_count; output_idx += gridDim.x*(blockDim.x/32)*batch_size) {
-	  int cur_idx_lines = (indice_count - output_idx) > batch_size ? batch_size : indice_count - output_idx;
+  for (int64_t output_idx = warp_id; output_idx < indice_count; output_idx += gridDim.x*(blockDim.x/32)) {
     OutputT* output_ptr = output + output_desc.start_off + output_stride * output_idx;
     if (!use_shm) {
       my_shared = output_ptr;
     }
-    for (int e = 0; e < cur_idx_lines; e ++) {
-		  int64_t embedding_table_idx = indices[output_idx + e];
-	  	EmbeddingT *emb_ptr = embedding + embedding_desc.start_off + embedding_table_idx*embedding_stride;
+		int64_t embedding_table_idx = indices[output_idx];
+	  EmbeddingT *emb_ptr = embedding + embedding_desc.start_off + embedding_table_idx*embedding_stride;
       
-      for (int emb_idx = lane_id * ALIGNMENT; emb_idx < embedding_size; emb_idx += ALIGNMENT * 32) {
-        mov_data<sizeof(EmbeddingT) * ALIGNMENT>(&embeddings, emb_ptr + emb_idx);
+    for (int emb_idx = lane_id * ALIGNMENT; emb_idx < embedding_size; emb_idx += ALIGNMENT * 32) {
+      mov_data<sizeof(EmbeddingT) * ALIGNMENT>(&embeddings, emb_ptr + emb_idx);
 #pragma unroll
-        for (int sub_idx = 0; sub_idx < ALIGNMENT; sub_idx++) {
-          typed_data_vector_at(outputs, sub_idx) =
-            convert_type<EmbeddingT, OutputT>(typed_data_vector_at(embeddings, sub_idx));
-        }
-        mov_data<sizeof(InputT) * ALIGNMENT>(my_shared + e*output_stride + emb_idx, &outputs);
+      for (int sub_idx = 0; sub_idx < ALIGNMENT; sub_idx++) {
+        typed_data_vector_at(outputs, sub_idx) =
+          convert_type<EmbeddingT, OutputT>(typed_data_vector_at(embeddings, sub_idx));
       }
-	  }
+      mov_data<sizeof(InputT) * ALIGNMENT>(my_shared + emb_idx, &outputs);
+    }
     //block.sync();
     if (use_shm) {
       //this variable is also for alignment
-      int copy_size = cur_idx_lines*output_stride*sizeof(OutputT);
-      //if (input_idx + cur_idx_lines < indice_count)//input_dim * sizeof(InputT) > 4 is needed
-      //  copy_size = (copy_size + async_copy_align - 1)/async_copy_align*async_copy_align;
+      int copy_size = output_desc.dim*sizeof(OutputT);
 	    cooperative_groups::memcpy_async(mywarp, output_ptr, my_shared, copy_size);
 	    cooperative_groups::wait(mywarp);
     } 
@@ -661,7 +655,7 @@ void gather_temp_func(EmbeddingT *embedding,
 #ifdef TMA_COPY
   int thread_num = (embedding_size+alignment-1)/ alignment;
   //thread_num = std::min(thread_num, 512);
-  thread_num = 256;
+  thread_num = 128;
   int64_t block_count = indice_count >= 2048 ? 2048 : static_cast<int>(indice_count);
   
   void (*kernel_fn)(EmbeddingT*,
