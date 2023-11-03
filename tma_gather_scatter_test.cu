@@ -30,7 +30,7 @@ using barrier = cuda::barrier<cuda::thread_scope_block>;
 #endif
 #ifdef GATHER
 //#define QUICK_VALIDATION_GATHER
-#define shm_size (16384/sizeof(InputT))//TODO this may be important, can be fine-tuned
+#define shm_size (16384/sizeof(EmbeddingT))//TODO this may be important, can be fine-tuned
                                        //in our experiments, less shm size may be better
 #endif
 
@@ -297,7 +297,7 @@ __global__ void scatter_kernel_TMA(const InputT* input,
   int64_t embedding_stride = embedding_desc.stride;
   int block_idx = block.group_index().x;
   int64_t input_stride     = input_desc.stride;
-  int async_copy_align = 16;
+  int async_copy_align = 16/sizeof(InputT);
   int batch_size = (shm_size/(blockDim.x/32)-async_copy_align)/input_stride;//indices batch size in lines
   typed_data_vector<EmbeddingT, ALIGNMENT> embeddings;
   typed_data_vector<InputT, ALIGNMENT> inputs;
@@ -313,9 +313,9 @@ __global__ void scatter_kernel_TMA(const InputT* input,
 	  const InputT* input_ptr = input + input_desc.start_off - input_off_tail + input_stride * input_idx;
     //this variable is also for alignment
     if (use_shm) {
-      int copy_size = (input_off_tail + cur_idx_lines*input_stride)*sizeof(InputT);
+      int copy_size = input_off_tail + cur_idx_lines*input_stride;
       if (input_idx + cur_idx_lines < indice_count) {//input_dim * sizeof(InputT) > 4 is needed
-        copy_size = (copy_size + async_copy_align -1)/async_copy_align*async_copy_align;
+        copy_size = (copy_size + async_copy_align -1)/async_copy_align*async_copy_align*sizeof(InputT);
         uint64_t token;
         if (threadIdx.x == 0) {
           cp_async_bulk_global_to_shared((void *)my_shared, (void *)input_ptr, copy_size, bar);
@@ -325,6 +325,7 @@ __global__ void scatter_kernel_TMA(const InputT* input,
         }
         bar.wait(cuda::std::move(token));
       } else {
+        copy_size *= sizeof(InputT);
 	      cooperative_groups::memcpy_async(mywarp, my_shared, input_ptr, copy_size);
 	      cooperative_groups::wait(mywarp);
       }
@@ -579,8 +580,13 @@ __global__ void gather_func_kernel_TMA(EmbeddingT* embedding,
 {
   auto block = cooperative_groups::this_thread_block();
   auto mywarp = cooperative_groups::tiled_partition<32>(block);
-  extern __shared__ OutputT shared[];
-  OutputT* my_shared; 
+  extern __shared__ EmbeddingT shared[];
+  __shared__ barrier bar;
+  if (threadIdx.x == 0) {
+    init(&bar, blockDim.x);
+  }
+  __syncwarp();
+  EmbeddingT* my_shared; 
   int warp_id = (threadIdx.x + blockIdx.x * blockDim.x)/32;
   int lane_id = threadIdx.x % 32;
 
@@ -588,50 +594,48 @@ __global__ void gather_func_kernel_TMA(EmbeddingT* embedding,
   int64_t embedding_stride = embedding_desc.stride;
   int block_idx = block.group_index().x;
   int64_t output_stride     = output_desc.stride;
-  //int async_copy_align = 4;
-  int batch_size = shm_size/(blockDim.x/32)/output_stride;//indices batch size for a block in lines
+  int async_copy_align = 16/sizeof(EmbeddingT);
+  int tma_copy_size = (embedding_desc.start_off % async_copy_align + embedding_size + async_copy_align - 1)/
+                       async_copy_align*async_copy_align;
+  bool use_shm = true;
+  if (shm_size/(blockDim.x/32) >= tma_copy_size) {
+    my_shared = shared + shm_size/(blockDim.x/32)*(threadIdx.x/32);
+  } else {
+    use_shm = false;
+  }
   
   typed_data_vector<EmbeddingT, ALIGNMENT> embeddings;
   typed_data_vector<OutputT, ALIGNMENT> outputs;
 
-  bool use_shm = true;
-  if (batch_size <= 0) {
-    use_shm = false;
-    batch_size = 1;
-  } else {
-    my_shared = shared + shm_size/(blockDim.x/32)*(threadIdx.x/32);
-  }
-  //int output_off_tail = output_desc.storage_offset%async_copy_align;//this is crutial for copy alignment, 4 bytes as alignment;
+  int emb_off_tail = embedding_desc.start_off%async_copy_align;//this is crutial for copy alignment, 4 bytes as alignment;
   
-  for (int64_t output_idx = warp_id*batch_size; output_idx < indice_count; output_idx += gridDim.x*(blockDim.x/32)*batch_size) {
-	  int cur_idx_lines = (indice_count - output_idx) > batch_size ? batch_size : indice_count - output_idx;
+  for (int64_t output_idx = warp_id; output_idx < indice_count; output_idx += gridDim.x*blockDim.x/32) {
+	  //int cur_idx_lines = (indice_count - output_idx) > batch_size ? batch_size : indice_count - output_idx;
     OutputT* output_ptr = output + output_desc.start_off + output_stride * output_idx;
-    if (!use_shm) {
-      my_shared = output_ptr;
+    int64_t embedding_table_idx = indices[output_idx];
+	  EmbeddingT *emb_ptr = embedding + embedding_desc.start_off + embedding_table_idx*embedding_stride;
+    if (use_shm && output_idx != indice_count-1) {
+      uint64_t token;
+      if (threadIdx.x == 0) {
+        cp_async_bulk_global_to_shared(my_shared, emb_ptr - emb_off_tail, tma_copy_size*sizeof(EmbeddingT), bar);
+        token = barrier_arrive_tx(bar, tma_copy_size*sizeof(EmbeddingT));
+      } else {
+        token = bar.arrive();
+      }
+      bar.wait(cuda::std::move(token));
     }
-    for (int e = 0; e < cur_idx_lines; e ++) {
-		  int64_t embedding_table_idx = indices[output_idx + e];
-	  	EmbeddingT *emb_ptr = embedding + embedding_desc.start_off + embedding_table_idx*embedding_stride;
-      
-      for (int emb_idx = lane_id * ALIGNMENT; emb_idx < embedding_size; emb_idx += ALIGNMENT * 32) {
+		for (int emb_idx = lane_id * ALIGNMENT; emb_idx < embedding_size; emb_idx += ALIGNMENT * 32) {
+      if (use_shm && output_idx != indice_count-1) 
+        mov_data<sizeof(EmbeddingT) * ALIGNMENT>(&embeddings, my_shared + emb_off_tail  + emb_idx);
+      else 
         mov_data<sizeof(EmbeddingT) * ALIGNMENT>(&embeddings, emb_ptr + emb_idx);
 #pragma unroll
-        for (int sub_idx = 0; sub_idx < ALIGNMENT; sub_idx++) {
-          typed_data_vector_at(outputs, sub_idx) =
-            convert_type<EmbeddingT, OutputT>(typed_data_vector_at(embeddings, sub_idx));
-        }
-        mov_data<sizeof(InputT) * ALIGNMENT>(my_shared + e*output_stride + emb_idx, &outputs);
+      for (int sub_idx = 0; sub_idx < ALIGNMENT; sub_idx++) {
+        typed_data_vector_at(outputs, sub_idx) =
+          convert_type<EmbeddingT, OutputT>(typed_data_vector_at(embeddings, sub_idx));
       }
-	  }
-    //block.sync();
-    if (use_shm) {
-      //this variable is also for alignment
-      int copy_size = cur_idx_lines*output_stride*sizeof(OutputT);
-      //if (input_idx + cur_idx_lines < indice_count)//input_dim * sizeof(InputT) > 4 is needed
-      //  copy_size = (copy_size + async_copy_align - 1)/async_copy_align*async_copy_align;
-	    cooperative_groups::memcpy_async(mywarp, output_ptr, my_shared, copy_size);
-	    cooperative_groups::wait(mywarp);
-    } 
+      mov_data<sizeof(InputT) * ALIGNMENT>(output_ptr + emb_idx, &outputs);
+    }
   }
   return;
 }
@@ -683,7 +687,7 @@ void gather_temp_func(EmbeddingT *embedding,
 #ifdef TMA_COPY
   int thread_num = (embedding_size+alignment-1)/ alignment;
   //thread_num = std::min(thread_num, 512);
-  thread_num = 256;
+  thread_num = 32;
   int64_t block_count = indice_count >= 2048 ? 2048 : static_cast<int>(indice_count);
   
   void (*kernel_fn)(EmbeddingT*,
@@ -719,7 +723,7 @@ void gather_temp_func(EmbeddingT *embedding,
                                         output_desc);
 #endif
 #ifdef TMA_COPY
-  kernel_fn<<<block_count, thread_num, shm_size*sizeof(OutputT)>>>(embedding,
+  kernel_fn<<<block_count, thread_num, shm_size*sizeof(EmbeddingT)>>>(embedding,
                                                                   embedding_desc,
                                                                   indices,
                                                                   indice_count,
