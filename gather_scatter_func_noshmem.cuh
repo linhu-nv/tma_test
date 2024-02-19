@@ -260,7 +260,7 @@ __global__ void gather_func_kernel(wholememory_gref_t embedding_gref,
 {
   int warp_id = (threadIdx.x + blockIdx.x * blockDim.x) / 32;
   int lane_id = threadIdx.x % 32;
-  int embedding_size       = embedding_desc.size[1];
+  int embedding_size       = embedding_desc.sizes[1];
   int64_t embedding_stride = embedding_desc.stride;
   int64_t output_stride    = output_desc.stride;
   typed_data_vector<EmbeddingT, ALIGNMENT> embeddings;

@@ -30,16 +30,17 @@ struct desc{
 //#define GATHER
 
 #ifdef SCATTER
-#define QUICK_VALIDATION_SCATTER
+//#define QUICK_VALIDATION_SCATTER
 #define shm_size (24576/sizeof(InputT))
 #endif
 #ifdef GATHER
-#define QUICK_VALIDATION_GATHER
+//#define QUICK_VALIDATION_GATHER
 #define shm_size (16384/sizeof(InputT))//TODO this may be important
 #endif
 
-//#define NAIVE_COPY
-#define TMA_COPY
+#define NAIVE_COPY
+//#define MEMASYNC_COPY
+//define TMA_COPY
 //#define TMA_PIPELINE_COPY
 
 //#define shm_size (49152/sizeof(InputT))
@@ -242,34 +243,35 @@ __global__ void scatter_func_kernel(const InputT* input,
                                     EmbeddingT* embedding,
                                     desc embedding_desc)
 {
-  int64_t input_idx          = static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
-  int thread_idx             = threadIdx.x;
-  IndexT embedding_table_idx = indices[input_idx];
-  if (embedding_table_idx < 0) return;
-  //wholememory::device_reference<EmbeddingT> embedding_dev_ref(embedding_gref);
+  int warp_id = (threadIdx.x + blockDim.x * blockIdx.x) / 32;
+  int lane_id = threadIdx.x % 32;
   int embedding_size       = embedding_desc.dim;
   int64_t embedding_stride = embedding_desc.stride;
   int64_t input_stride     = input_desc.stride;
   typed_data_vector<EmbeddingT, ALIGNMENT> embeddings;
   typed_data_vector<InputT, ALIGNMENT> inputs;
-  const InputT* input_ptr  = input + input_desc.start_off + input_stride * input_idx;
-  int64_t embedding_offset = embedding_desc.start_off + embedding_table_idx * embedding_stride;
-  for (; input_idx < indice_count; input_idx += static_cast<int64_t>(gridDim.x) * blockDim.y) {
-    for (int emb_idx = thread_idx * ALIGNMENT; emb_idx < embedding_size; emb_idx += ALIGNMENT * blockDim.x) {
+  for (int64_t input_idx = warp_id; input_idx < indice_count; input_idx += gridDim.x * (blockDim.x / 32)) {
+    const InputT* input_ptr = input + input_desc.start_off + input_stride * input_idx;
+    IndexT embedding_table_idx = indices[input_idx];
+    if (embedding_table_idx < 0) continue;
+    EmbeddingT* emb_ptr = embedding + embedding_desc.start_off + embedding_table_idx * embedding_stride;
+    for (int emb_idx = lane_id * ALIGNMENT; emb_idx < embedding_size; 
+          emb_idx += ALIGNMENT * 32) {
       mov_data<sizeof(InputT) * ALIGNMENT>(&inputs, input_ptr + emb_idx);
 #pragma unroll
       for (int sub_idx = 0; sub_idx < ALIGNMENT; sub_idx++) {
         typed_data_vector_at(embeddings, sub_idx) =
           convert_type<InputT, EmbeddingT>(typed_data_vector_at(inputs, sub_idx));
       }
-      mov_data<sizeof(EmbeddingT) * ALIGNMENT>(embedding + embedding_offset + emb_idx,
+      mov_data<sizeof(EmbeddingT) * ALIGNMENT>(emb_ptr + emb_idx,
                                                &embeddings);
     }
   }
 }
 
+
 template <int ALIGNMENT = 3>
-__global__ void scatter_kernel_TMA(const InputT* input,
+__global__ void scatter_kernel_memcpyasync(const InputT* input,
                                     desc input_desc,
                                     const IndexT* indices,
                                     int indice_count,
@@ -403,7 +405,7 @@ void scatter_temp_func(InputT* input,
   int wm_alignment   = determine_wholememory_alignment_elt_count(embedding_desc);
   int mm_alignment   = determine_memory_alignment_elt_count(input, input_desc);
   int alignment      = std::min<int>(wm_alignment, mm_alignment);
-  //int embedding_size = embedding_desc.dim;
+  int embedding_size = embedding_desc.dim;
 #ifdef NAIVE_COPY
   int thread_x       = (embedding_size + alignment-1)/alignment;
   thread_x           = std::min(thread_x, 256);
@@ -450,7 +452,7 @@ void scatter_temp_func(InputT* input,
                                         embedding,
                                         embedding_desc);
 #endif
-#ifdef TMA_COPY
+#ifdef MEMASYNC_COPY
   void (*kernel_fn)(const InputT*,
                     desc,
                     const IndexT*,
@@ -459,11 +461,11 @@ void scatter_temp_func(InputT* input,
                     desc) = nullptr;
   //printf("key parameters: %d %d %d %d\n",thread_x, thread_y, block_count, alignment);
   switch (alignment) {
-    case 16: {  kernel_fn = scatter_kernel_TMA<16>; break;}
-    case 8: {  kernel_fn = scatter_kernel_TMA<8>; break;}
-    case 4: {  kernel_fn = scatter_kernel_TMA<4>; break;}
-    case 2: {  kernel_fn = scatter_kernel_TMA<2>; break;}
-    case 1: {  kernel_fn = scatter_kernel_TMA<1>; break;}
+    case 16: {  kernel_fn = scatter_kernel_memcpyasync<16>; break;}
+    case 8: {  kernel_fn = scatter_kernel_memcpyasync<8>; break;}
+    case 4: {  kernel_fn = scatter_kernel_memcpyasync<4>; break;}
+    case 2: {  kernel_fn = scatter_kernel_memcpyasync<2>; break;}
+    case 1: {  kernel_fn = scatter_kernel_memcpyasync<1>; break;}
     default: {
       printf("scatter func alignment=%d.\n", alignment); return;
     }
@@ -524,21 +526,21 @@ __global__ void gather_func_kernel(EmbeddingT* embedding,
                                    OutputT* output,
                                    desc output_desc)
 {
-  int64_t output_idx         = static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
-  IndexT embedding_table_idx = indices[output_idx];
-  if (embedding_table_idx < 0) return;
-  int thread_idx           = threadIdx.x;
+  int warp_id = (threadIdx.x + blockIdx.x * blockDim.x) / 32;
+  int lane_id = threadIdx.x % 32;
   int embedding_size       = embedding_desc.dim;
   int64_t embedding_stride = embedding_desc.stride;
   int64_t output_stride    = output_desc.stride;
   typed_data_vector<EmbeddingT, ALIGNMENT> embeddings;
   typed_data_vector<OutputT, ALIGNMENT> outputs;
-  OutputT* output_ptr      = output + output_desc.start_off + output_stride * output_idx;
-  int64_t embedding_offset = embedding_desc.start_off + embedding_table_idx * embedding_stride;
-  for (; output_idx < indice_count; output_idx += static_cast<int64_t>(gridDim.x) * blockDim.y) {
-    for (int emb_idx = thread_idx * ALIGNMENT; emb_idx < embedding_size;
-         emb_idx += ALIGNMENT * blockDim.x) {
-      mov_data<sizeof(EmbeddingT) * ALIGNMENT>(&embeddings, embedding + embedding_offset + emb_idx);
+  for (int64_t output_idx = warp_id; output_idx < indice_count; output_idx += gridDim.x * (blockDim.x / 32)) {
+    OutputT* output_ptr = output + output_desc.start_off + output_stride * output_idx;
+    IndexT embedding_table_idx = indices[output_idx];
+    if (embedding_table_idx < 0) continue;
+    EmbeddingT* emb_ptr = embedding + embedding_desc.start_off + embedding_table_idx * embedding_stride;
+    for (int emb_idx = lane_id * ALIGNMENT; emb_idx < embedding_size;
+         emb_idx += ALIGNMENT * 32) {
+      mov_data<sizeof(EmbeddingT) * ALIGNMENT>(&embeddings, emb_ptr + emb_idx);
 #pragma unroll
       for (int sub_idx = 0; sub_idx < ALIGNMENT; sub_idx++) {
         typed_data_vector_at(outputs, sub_idx) =
@@ -550,7 +552,7 @@ __global__ void gather_func_kernel(EmbeddingT* embedding,
 }
 
 template <int ALIGNMENT = 1>
-__global__ void gather_func_kernel_TMA(EmbeddingT* embedding,
+__global__ void gather_func_kernel_memcpyasync(EmbeddingT* embedding,
                                    desc embedding_desc,
                                    const IndexT* indices,
                                    int64_t indice_count,
@@ -621,19 +623,8 @@ void gather_temp_func(EmbeddingT *embedding,
   int alignment      = std::min<int>(wm_alignment, mm_alignment);
   int embedding_size = embedding_desc.dim;
 #ifdef NAIVE_COPY
-  int thread_x       = (embedding_size+alignment-1)/alignment*alignment;
-  thread_x           = std::min(thread_x, 256);
-  int thread_y       = 1;
-  if (thread_x < 64) {
-    int power2_thread_x = 1;
-    for (; power2_thread_x < thread_x; power2_thread_x *= 2)
-      ;
-    thread_x = power2_thread_x;
-    thread_y = 64 / thread_x;
-  }
-  int64_t block_count_64 = (indice_count + thread_y - 1) / thread_y;
-  int block_count = block_count_64 >= INT_MAX ? INT_MAX / 4 : static_cast<int>(block_count_64);
-  dim3 block_dim(thread_x, thread_y, 1);
+  int block_dim = 1024;
+  int block_count = 1568 > indice_count / 32 ? 1568 : indice_count / 32;
   void (*kernel_fn)(EmbeddingT*,
                     desc,
                     const IndexT*,
@@ -652,11 +643,11 @@ void gather_temp_func(EmbeddingT *embedding,
     }
   }
 #endif
-#ifdef TMA_COPY
+#ifdef MEMASYNC_COPY
   int thread_num = (embedding_size+alignment-1)/ alignment;
   //thread_num = std::min(thread_num, 512);
-  thread_num = 128;
-  int64_t block_count = indice_count >= 2048 ? 2048 : static_cast<int>(indice_count);
+  thread_num = 1024;
+  int64_t block_count = indice_count / 32 >= 1568 ? 1568 : static_cast<int>(indice_count / 32);
   
   void (*kernel_fn)(EmbeddingT*,
                     desc,
@@ -665,11 +656,11 @@ void gather_temp_func(EmbeddingT *embedding,
                     OutputT*,
                     desc) = nullptr;
   switch (alignment) {
-    case 16: { kernel_fn = gather_func_kernel_TMA<16>; break;}
-    case 8: { kernel_fn = gather_func_kernel_TMA<8>; break;}
-    case 4: { kernel_fn = gather_func_kernel_TMA<4>; break;}
-    case 2: { kernel_fn = gather_func_kernel_TMA<2>; break;}
-    case 1: { kernel_fn = gather_func_kernel_TMA<1>; break;}
+    case 16: { kernel_fn = gather_func_kernel_memcpyasync<16>; break;}
+    case 8: { kernel_fn = gather_func_kernel_memcpyasync<8>; break;}
+    case 4: { kernel_fn = gather_func_kernel_memcpyasync<4>; break;}
+    case 2: { kernel_fn = gather_func_kernel_memcpyasync<2>; break;}
+    case 1: { kernel_fn = gather_func_kernel_memcpyasync<1>; break;}
     default: {
       printf("gather func alignment=%d.", alignment);
       return;
@@ -690,7 +681,7 @@ void gather_temp_func(EmbeddingT *embedding,
                                         output,
                                         output_desc);
 #endif
-#ifdef TMA_COPY
+#ifdef MEMASYNC_COPY
   kernel_fn<<<block_count, thread_num, shm_size*sizeof(OutputT)>>>(embedding,
                                                                   embedding_desc,
                                                                   indices,
@@ -722,12 +713,12 @@ int main (int argc, char**argv) {
   int output_dim = embedding_dim;
   int input_dim = embedding_dim;
   uint64_t embedding_size = 10 * 1024UL * 1024UL;
-  uint64_t input_size = embedding_size/2;
-  uint64_t output_size = embedding_size/2;
+  uint64_t input_size = embedding_size/4;
+  uint64_t output_size = embedding_size/4;
   printf("the embedding dim is %d, emb_start_off %d, input/output_start_off %d\n", embedding_dim, emb_start_off, input_start_off);
 
   uint64_t total_size_gb = (embedding_size + input_size)*embedding_dim*sizeof(EmbeddingT)/1024/1024/1024;
-  printf("the total size is %d GB\n", total_size_gb);
+  printf("the total size is %lu GB\n", total_size_gb);
 #ifdef SCATTER
   //construct input
   InputT *input;
@@ -871,7 +862,7 @@ int main (int argc, char**argv) {
           //printf("the %d th index for %d th iteration is %ld\n", index_pos, iter, i);
         if (h_embedding[i*emb_stride + emb_start_off] != in_malloc_size-input_start_off-1-index_pos*in_stride) {
           valid = false;
-          printf("scattered, i = %lu, index_pos = %d, embedding ele is %d, should be %d\n",
+          printf("scattered, i = %lu, index_pos = %d, embedding ele is %d, should be %ld\n",
                                 i, index_pos, h_embedding[i*emb_stride + emb_start_off], 
                                 in_malloc_size-input_start_off-1-index_pos*in_stride);
           break;
