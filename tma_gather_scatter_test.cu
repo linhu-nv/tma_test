@@ -687,7 +687,7 @@ __global__ void gather_func_kernel_memcpyasync(EmbeddingT* embedding,
         typed_data_vector_at(outputs, sub_idx) =
           convert_type<EmbeddingT, OutputT>(typed_data_vector_at(embeddings, sub_idx));
       }
-      mov_data<sizeof(InputT) * ALIGNMENT>(my_shared + emb_idx, &outputs);
+      mov_data<sizeof(EmbeddingT) * ALIGNMENT>(my_shared + emb_idx, &outputs);
     }
     //block.sync();
     if (use_shm) {
@@ -702,7 +702,7 @@ __global__ void gather_func_kernel_memcpyasync(EmbeddingT* embedding,
 
 
 template <int ALIGNMENT = 1>
-__global__ void gather_func_kernel_TMA(EmbeddingT* embedding,
+__global__ void gather_func_kernel_TMA_V2(EmbeddingT* embedding,
                                        desc embedding_desc,
                                        const IndexT* indices,
                                        int64_t indice_count,
@@ -710,7 +710,7 @@ __global__ void gather_func_kernel_TMA(EmbeddingT* embedding,
                                        desc output_desc)
 {
   __shared__ alignas(16) char shmem[6144];
-  InputT* sh_buf = reinterpret_cast<InputT*>(shmem);
+  EmbeddingT* sh_buf = reinterpret_cast<EmbeddingT*>(shmem);
   __shared__ barrier bar;
   if (threadIdx.x == 0) { init(&bar, blockDim.x); }
   __syncwarp();
@@ -719,13 +719,16 @@ __global__ void gather_func_kernel_TMA(EmbeddingT* embedding,
   int64_t embedding_stride = embedding_desc.stride;
   int64_t output_stride    = output_desc.stride;
 
+  typed_data_vector<EmbeddingT, ALIGNMENT> embeddings;
+  typed_data_vector<OutputT, ALIGNMENT> outputs;
+
   int warp_id = (threadIdx.x + blockIdx.x * blockDim.x) / 32;
   for (int64_t output_idx = warp_id; output_idx < indice_count; output_idx += gridDim.x * (blockDim.x / 32)) {
     OutputT* output_ptr = output + output_desc.start_off + output_stride * output_idx;
     IndexT embedding_table_idx = indices[output_idx];
     if (embedding_table_idx < 0) continue;
     EmbeddingT* emb_ptr = embedding + embedding_desc.start_off + embedding_table_idx * embedding_stride;
-    int copy_size = sizeof(InputT) * embedding_size;
+    int copy_size = sizeof(EmbeddingT) * embedding_size;
     // Load data:
     uint64_t token;
     if (threadIdx.x == 0) {
@@ -735,13 +738,18 @@ __global__ void gather_func_kernel_TMA(EmbeddingT* embedding,
         token = bar.arrive();
     }
     bar.wait(cuda::std::move(token));
-
-    // Update in shared memory
-    //for (int i = threadIdx.x; i < buf_len; i += blockDim.x) {
-    //    smem_buffer[i] += i;
-    //}
+    //data convert in shared memory
+    for (int emb_idx = threadIdx.x * ALIGNMENT; emb_idx < embedding_size; emb_idx += ALIGNMENT * 32) {
+      mov_data<sizeof(EmbeddingT) * ALIGNMENT>(&embeddings, sh_buf + emb_idx);
+#pragma unroll
+      for (int sub_idx = 0; sub_idx < ALIGNMENT; sub_idx++) {
+        typed_data_vector_at(outputs, sub_idx) =
+          convert_type<EmbeddingT, OutputT>(typed_data_vector_at(embeddings, sub_idx));
+      }
+      mov_data<sizeof(OutputT) * ALIGNMENT>(sh_buf + emb_idx, &outputs);
+    }
     fence_proxy_async_shared_cta();
-    //__syncthreads();
+    __syncwarp();
 
     // Write back to global memory:
     if (threadIdx.x == 0) {
@@ -756,17 +764,15 @@ __global__ void gather_func_kernel_TMA(EmbeddingT* embedding,
 }
 
 template <int ALIGNMENT = 1>
-__global__ void gather_func_kernel_TMA_V2(EmbeddingT* embedding,
+__global__ void gather_func_kernel_TMA(EmbeddingT* embedding,
                                        desc embedding_desc,
                                        const IndexT* indices,
                                        int64_t indice_count,
                                        OutputT* output,
                                        desc output_desc)
 {
-  __shared__ alignas(16) char shmem[49152];
-  int sh_mem_off = threadIdx.x < 8 ? threadIdx.x : 0;
-  InputT* sh_buf = reinterpret_cast<InputT*>(shmem + sh_mem_off * 6144);
-  //only eight threads are working
+  __shared__ alignas(16) char shmem[6144];
+  EmbeddingT* sh_buf = reinterpret_cast<EmbeddingT*>(shmem);
   __shared__ barrier bar;
   if (threadIdx.x == 0) { init(&bar, blockDim.x); }
   __syncwarp();
@@ -775,18 +781,16 @@ __global__ void gather_func_kernel_TMA_V2(EmbeddingT* embedding,
   int64_t embedding_stride = embedding_desc.stride;
   int64_t output_stride    = output_desc.stride;
 
-  int tid = threadIdx.x + (blockIdx.x * blockDim.x) / 32 * 8;
-  for (int64_t output_idx = tid; output_idx < indice_count; output_idx += (gridDim.x * blockDim.x) / 4) {
+  int warp_id = (threadIdx.x + blockIdx.x * blockDim.x) / 32;
+  for (int64_t output_idx = warp_id; output_idx < indice_count; output_idx += gridDim.x * (blockDim.x / 32)) {
     OutputT* output_ptr = output + output_desc.start_off + output_stride * output_idx;
-    bool exec_copy = threadIdx.x < 8 ? true : false;
-    IndexT embedding_table_idx = exec_copy ? indices[output_idx] : -1;
-    if (embedding_table_idx < 0)
-      exec_copy = false;
+    IndexT embedding_table_idx = indices[output_idx];
+    if (embedding_table_idx < 0) continue;
     EmbeddingT* emb_ptr = embedding + embedding_desc.start_off + embedding_table_idx * embedding_stride;
-    int copy_size = sizeof(InputT) * embedding_size;
+    int copy_size = sizeof(EmbeddingT) * embedding_size;
     // Load data:
     uint64_t token;
-    if (exec_copy) {
+    if (threadIdx.x == 0) {
         cp_async_bulk_global_to_shared(sh_buf, emb_ptr, copy_size, bar);
         token = barrier_arrive_tx(bar, copy_size);
     } else {
@@ -802,7 +806,7 @@ __global__ void gather_func_kernel_TMA_V2(EmbeddingT* embedding,
     //__syncthreads();
 
     // Write back to global memory:
-    if (exec_copy) {
+    if (threadIdx.x == 0) {
         cp_async_bulk_shared_to_global(output_ptr, sh_buf, copy_size);
         cp_async_bulk_commit_group();
         cp_async_bulk_wait_group_read<0>();
@@ -939,7 +943,7 @@ void gather_temp_func(EmbeddingT *embedding,
                     OutputT*,
                     desc) = nullptr;
   if (use_TMA) {
-    SM_count = indice_count > 132 ? 132 : indice_count;
+    SM_count = indice_count >  49 ? 49 : indice_count;
     thread_num = 32;
     switch (alignment) {
       case 16: { kernel_fn = gather_func_kernel_TMA_V2<16>; break;}
@@ -1010,7 +1014,7 @@ void gather_temp_func(EmbeddingT *embedding,
 #endif
 #ifdef TMA_COPY_V2
   if (use_TMA) {
-    kernel_fn<<<SM_count * 4, thread_num>>>(embedding,
+    kernel_fn<<<SM_count * 32, thread_num>>>(embedding,
                                         embedding_desc,
                                         indices,
                                         indice_count,
