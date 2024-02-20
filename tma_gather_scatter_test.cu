@@ -27,7 +27,8 @@
 
 //#define NAIVE_COPY
 //#define MEMASYNC_COPY
-#define TMA_COPY
+//#define TMA_COPY
+#define TMA_COPY_V2
 //#define shm_size (49152/sizeof(InputT))
 
 using barrier = cuda::barrier<cuda::thread_scope_block>;
@@ -754,6 +755,62 @@ __global__ void gather_func_kernel_TMA(EmbeddingT* embedding,
   return ;
 }
 
+template <int ALIGNMENT = 1>
+__global__ void gather_func_kernel_TMA_V2(EmbeddingT* embedding,
+                                       desc embedding_desc,
+                                       const IndexT* indices,
+                                       int64_t indice_count,
+                                       OutputT* output,
+                                       desc output_desc)
+{
+  __shared__ alignas(16) char shmem[196608];
+  InputT* sh_buf = reinterpret_cast<InputT*>(shmem + threadIdx.x * 6144);
+  __shared__ barrier bar;
+  if (threadIdx.x == 0) { init(&bar, blockDim.x); }
+  __syncwarp();
+  
+  int embedding_size       = embedding_desc.dim;
+  int64_t embedding_stride = embedding_desc.stride;
+  int64_t output_stride    = output_desc.stride;
+
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  for (int64_t output_idx = tid; output_idx < indice_count; output_idx += gridDim.x * blockDim.x) {
+    OutputT* output_ptr = output + output_desc.start_off + output_stride * output_idx;
+    IndexT embedding_table_idx = indices[output_idx];
+    bool exec_copy = true;
+    if (embedding_table_idx < 0)
+      exec_copy = false;
+    EmbeddingT* emb_ptr = embedding + embedding_desc.start_off + embedding_table_idx * embedding_stride;
+    int copy_size = sizeof(InputT) * embedding_size;
+    // Load data:
+    uint64_t token;
+    if (exec_copy) {
+        cp_async_bulk_global_to_shared(sh_buf, emb_ptr, copy_size, bar);
+        token = barrier_arrive_tx(bar, copy_size);
+    } else {
+        token = bar.arrive();
+    }
+    bar.wait(cuda::std::move(token));
+
+    // Update in shared memory
+    //for (int i = threadIdx.x; i < buf_len; i += blockDim.x) {
+    //    smem_buffer[i] += i;
+    //}
+    fence_proxy_async_shared_cta();
+    //__syncthreads();
+
+    // Write back to global memory:
+    if (exec_copy) {
+        cp_async_bulk_shared_to_global(output_ptr, sh_buf, copy_size);
+        cp_async_bulk_commit_group();
+        cp_async_bulk_wait_group_read<0>();
+    }
+    __threadfence();
+    __syncwarp();  
+  }
+  return ;
+}
+
 void gather_temp_func(EmbeddingT *embedding,
                       desc embedding_desc,
                       IndexT* indices,
@@ -820,10 +877,7 @@ void gather_temp_func(EmbeddingT *embedding,
                      (output_desc.dim * sizeof(OutputT)) % 16 == 0;
   bool no_data_transfer = (sizeof(InputT) == sizeof(OutputT));
   bool with_in_buf_size = embedding_desc.dim * sizeof(InputT) <= 6144;
-  bool hopper_arch = false;
-#if __CUDA_ARCH__ == 900
-  hopper_arch = true;
-#endif
+  bool hopper_arch = true;
   bool use_TMA = TMA_aligned && no_data_transfer && hopper_arch && with_in_buf_size;
   int SM_count, thread_num;
   void (*kernel_fn)(EmbeddingT*,
@@ -846,6 +900,7 @@ void gather_temp_func(EmbeddingT *embedding,
         return;
       }
     }
+    printf("   use TMA for gather\n");
   } else {
     SM_count = indice_count / 32 > 1568 ? 1568 : indice_count / 32;
     thread_num = 1024;
@@ -860,6 +915,57 @@ void gather_temp_func(EmbeddingT *embedding,
         return;
       }
     }
+    printf("   use naive copy here because constraints not satisfied\n");
+  }
+#endif
+#ifdef TMA_COPY_V2
+  bool TMA_aligned = (embedding_desc.start_off * sizeof(InputT)) % 16 == 0 &&
+                     (embedding_desc.stride * sizeof(InputT)) % 16 == 0 &&
+                     (embedding_desc.dim * sizeof(InputT)) % 16 == 0 &&
+                     (output_desc.start_off * sizeof(OutputT)) % 16 == 0 &&
+                     (output_desc.stride *sizeof(OutputT)) % 16 == 0 &&
+                     (output_desc.dim * sizeof(OutputT)) % 16 == 0;
+  bool no_data_transfer = (sizeof(InputT) == sizeof(OutputT));
+  bool with_in_buf_size = embedding_desc.dim * sizeof(InputT) <= 6144;
+  bool hopper_arch = true;
+  bool use_TMA = TMA_aligned && no_data_transfer && hopper_arch && with_in_buf_size;
+  int SM_count, thread_num;
+  void (*kernel_fn)(EmbeddingT*,
+                    desc,
+                    const IndexT*,
+                    int64_t,
+                    OutputT*,
+                    desc) = nullptr;
+  if (use_TMA) {
+    SM_count = indice_count > 49 ? 49 : indice_count;
+    thread_num = 32;
+    switch (alignment) {
+      case 16: { kernel_fn = gather_func_kernel_TMA_V2<16>; break;}
+      case 8: { kernel_fn = gather_func_kernel_TMA_V2<8>; break;}
+      case 4: { kernel_fn = gather_func_kernel_TMA_V2<4>; break;}
+      case 2: { kernel_fn = gather_func_kernel_TMA_V2<2>; break;}
+      case 1: { kernel_fn = gather_func_kernel_TMA_V2<1>; break;}
+      default: {
+        printf("gather func alignment=%d.", alignment);
+        return;
+      }
+    }
+    printf("   use TMA for gather\n");
+  } else {
+    SM_count = indice_count / 32 > 1568 ? 1568 : indice_count / 32;
+    thread_num = 1024;
+    switch (alignment) {
+      case 16: { kernel_fn = gather_func_kernel<16>; break;}
+      case 8: { kernel_fn = gather_func_kernel<8>; break;}
+      case 4: { kernel_fn = gather_func_kernel<4>; break;}
+      case 2: { kernel_fn = gather_func_kernel<2>; break;}
+      case 1: { kernel_fn = gather_func_kernel<1>; break;}
+      default: {
+        printf("gather func alignment=%d.", alignment);
+        return;
+      }
+    }
+    printf("   use naive copy here because constraints not satisfied\n");
   }
 #endif
   cudaEvent_t start, stop;
@@ -884,6 +990,23 @@ void gather_temp_func(EmbeddingT *embedding,
                                                                   output_desc);
 #endif
 #ifdef TMA_COPY
+  if (use_TMA) {
+    kernel_fn<<<SM_count * 32, thread_num>>>(embedding,
+                                        embedding_desc,
+                                        indices,
+                                        indice_count,
+                                        output,
+                                        output_desc);
+  } else {
+    kernel_fn<<<SM_count, thread_num>>>(embedding,
+                                        embedding_desc,
+                                        indices,
+                                        indice_count,
+                                        output,
+                                        output_desc);
+  }
+#endif
+#ifdef TMA_COPY_V2
   if (use_TMA) {
     kernel_fn<<<SM_count * 32, thread_num>>>(embedding,
                                         embedding_desc,
