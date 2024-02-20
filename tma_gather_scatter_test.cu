@@ -10,6 +10,116 @@
 #include <cooperative_groups/memcpy_async.h>
 #include <cuda/barrier>
 #include <cuda/pipeline>
+#include <cuda/std/utility> // cuda::std::move
+
+
+//#define SCATTER
+#define GATHER
+
+#ifdef SCATTER
+//#define QUICK_VALIDATION_SCATTER
+#define shm_size (24576/sizeof(InputT))
+#endif
+#ifdef GATHER
+//#define QUICK_VALIDATION_GATHER
+#define shm_size (16384/sizeof(InputT))//TODO this may be important
+#endif
+
+//#define NAIVE_COPY
+//#define MEMASYNC_COPY
+#define TMA_COPY
+//#define shm_size (49152/sizeof(InputT))
+
+using barrier = cuda::barrier<cuda::thread_scope_block>;
+//namespace cde = cuda::device::experimental;
+
+static constexpr int buf_len = 1024;
+
+inline __device__
+void cp_async_bulk_global_to_shared(void *__dest, const void *__src, _CUDA_VSTD::uint32_t __size, ::cuda::barrier<::cuda::thread_scope_block> &__bar)
+{
+    //_LIBCUDACXX_DEBUG_ASSERT(__size % 16 == 0,   "Size must be multiple of 16.");
+    //_LIBCUDACXX_DEBUG_ASSERT(__isShared(__dest), "Destination must be shared memory address.");
+    //_LIBCUDACXX_DEBUG_ASSERT(__isGlobal(__src),  "Source must be global memory address.");
+
+    asm volatile(
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
+        :
+        : "r"(static_cast<_CUDA_VSTD::uint32_t>(__cvta_generic_to_shared(__dest))),
+          "l"(static_cast<_CUDA_VSTD::uint64_t>(__cvta_generic_to_global(__src))),
+          "r"(__size),
+          "r"(static_cast<_CUDA_VSTD::uint32_t>(__cvta_generic_to_shared(::cuda::device::barrier_native_handle(__bar))))
+        : "memory");
+}
+
+inline __device__
+void fence_proxy_async_shared_cta() {
+    asm volatile("fence.proxy.async.shared::cta; \n":::"memory");
+}
+
+inline __device__
+void cp_async_bulk_shared_to_global(void *__dest, const void * __src, _CUDA_VSTD::uint32_t __size)
+{
+    //_LIBCUDACXX_DEBUG_ASSERT(__size % 16 == 0,   "Size must be multiple of 16.");
+    //_LIBCUDACXX_DEBUG_ASSERT(__isGlobal(__dest), "Destination must be global memory address.");
+    //_LIBCUDACXX_DEBUG_ASSERT(__isShared(__src),  "Source must be shared memory address.");
+
+    asm volatile(
+        "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;\n"
+        :
+        : "l"(static_cast<_CUDA_VSTD::uint64_t>(__cvta_generic_to_global(__dest))),
+          "r"(static_cast<_CUDA_VSTD::uint32_t>(__cvta_generic_to_shared(__src))),
+          "r"(__size)
+        : "memory");
+}
+
+inline __device__
+void cp_async_bulk_commit_group()
+{
+    asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
+}
+
+template <int n_prior>
+inline __device__
+void cp_async_bulk_wait_group_read()
+{
+  //static_assert(n_prior <= 63, "cp_async_bulk_wait_group_read: waiting for more than 63 groups is not supported.");
+  asm volatile("cp.async.bulk.wait_group.read %0; \n"
+               :
+               : "n"(n_prior)
+               : "memory");
+}
+
+
+//inline __device__
+//_CUDA_VSTD::uint64_t * barrier_native_handle(barrier & b) {
+//    return reinterpret_cast<_CUDA_VSTD::uint64_t *>(&b.__barrier);
+//}
+
+inline __device__
+barrier::arrival_token barrier_arrive_tx(
+    barrier & __b,
+    //_CUDA_VSTD::ptrdiff_t __arrive_count_update,
+    _CUDA_VSTD::ptrdiff_t __transaction_count_update) {
+
+    //_LIBCUDACXX_DEBUG_ASSERT(__isShared(barrier_native_handle(__b)), "Barrier must be located in local shared memory.");
+    //_LIBCUDACXX_DEBUG_ASSERT(1 <= __arrive_count_update, "Arrival count update must be at least one.");
+    //_LIBCUDACXX_DEBUG_ASSERT(__arrive_count_update <= (1 << 20) - 1, "Arrival count update cannot exceed 2^20 - 1.");
+    //_LIBCUDACXX_DEBUG_ASSERT(__transaction_count_update >= 0, "Transaction count update must be non-negative.");
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#contents-of-the-mbarrier-object
+    //_LIBCUDACXX_DEBUG_ASSERT(__transaction_count_update <= (1 << 20) - 1, "Transaction count update cannot exceed 2^20 - 1.");
+
+    barrier::arrival_token __token = {};
+    // On architectures pre-sm90, arrive_tx is not supported.
+    auto __bh = __cvta_generic_to_shared(cuda::device::barrier_native_handle(__b));
+    asm (
+        "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 %0, [%1], %2;"
+        : "=l"(__token)
+        : "r"(static_cast<_CUDA_VSTD::uint32_t>(__bh)),
+          "r"(static_cast<_CUDA_VSTD::uint32_t>(__transaction_count_update))
+        : "memory");
+    return __token;
+}
 
 using namespace std;
 
@@ -25,27 +135,6 @@ struct desc{
   desc(int _s, int _d, int _stride, int _startoff):
         size(_s), dim(_d), stride(_stride), start_off(_startoff){}
 };
-
-#define SCATTER
-//#define GATHER
-
-#ifdef SCATTER
-//#define QUICK_VALIDATION_SCATTER
-#define shm_size (24576/sizeof(InputT))
-#endif
-#ifdef GATHER
-//#define QUICK_VALIDATION_GATHER
-#define shm_size (16384/sizeof(InputT))//TODO this may be important
-#endif
-
-#define NAIVE_COPY
-//#define MEMASYNC_COPY
-//define TMA_COPY
-//#define TMA_PIPELINE_COPY
-
-//#define shm_size (49152/sizeof(InputT))
-
-
 
 #define CUDA_TRY(call)                                                          \
   do {                                                                          \
@@ -481,7 +570,7 @@ void scatter_temp_func(InputT* input,
                                                                           embedding,
                                                                           embedding_desc);
 #endif
-#ifdef TMA_PIPELINE_COPY
+#ifdef TMA_COPY
    void (*kernel_fn)(const InputT*,
                     desc,
                     const IndexT*,
@@ -611,6 +700,60 @@ __global__ void gather_func_kernel_memcpyasync(EmbeddingT* embedding,
 }
 
 
+template <int ALIGNMENT = 1>
+__global__ void gather_func_kernel_TMA(EmbeddingT* embedding,
+                                       desc embedding_desc,
+                                       const IndexT* indices,
+                                       int64_t indice_count,
+                                       OutputT* output,
+                                       desc output_desc)
+{
+  __shared__ alignas(16) char shmem[6144];
+  InputT* sh_buf = reinterpret_cast<InputT*>(shmem);
+  __shared__ barrier bar;
+  if (threadIdx.x == 0) { init(&bar, blockDim.x); }
+  __syncwarp();
+  
+  int embedding_size       = embedding_desc.dim;
+  int64_t embedding_stride = embedding_desc.stride;
+  int64_t output_stride    = output_desc.stride;
+
+  int warp_id = (threadIdx.x + blockIdx.x * blockDim.x) / 32;
+  for (int64_t output_idx = warp_id; output_idx < indice_count; output_idx += gridDim.x * (blockDim.x / 32)) {
+    OutputT* output_ptr = output + output_desc.start_off + output_stride * output_idx;
+    IndexT embedding_table_idx = indices[output_idx];
+    if (embedding_table_idx < 0) continue;
+    EmbeddingT* emb_ptr = embedding + embedding_desc.start_off + embedding_table_idx * embedding_stride;
+    int copy_size = sizeof(InputT) * embedding_size;
+    // Load data:
+    uint64_t token;
+    if (threadIdx.x == 0) {
+        cp_async_bulk_global_to_shared(sh_buf, emb_ptr, copy_size, bar);
+        token = barrier_arrive_tx(bar, copy_size);
+    } else {
+        token = bar.arrive();
+    }
+    bar.wait(cuda::std::move(token));
+
+    // Update in shared memory
+    //for (int i = threadIdx.x; i < buf_len; i += blockDim.x) {
+    //    smem_buffer[i] += i;
+    //}
+    fence_proxy_async_shared_cta();
+    //__syncthreads();
+
+    // Write back to global memory:
+    if (threadIdx.x == 0) {
+        cp_async_bulk_shared_to_global(output_ptr, sh_buf, copy_size);
+        cp_async_bulk_commit_group();
+        cp_async_bulk_wait_group_read<0>();
+    }
+    __threadfence();
+    __syncwarp();  
+  }
+  return ;
+}
+
 void gather_temp_func(EmbeddingT *embedding,
                       desc embedding_desc,
                       IndexT* indices,
@@ -668,6 +811,57 @@ void gather_temp_func(EmbeddingT *embedding,
   }
   
 #endif
+#ifdef TMA_COPY
+  bool TMA_aligned = (embedding_desc.start_off * sizeof(InputT)) % 16 == 0 &&
+                     (embedding_desc.stride * sizeof(InputT)) % 16 == 0 &&
+                     (embedding_desc.dim * sizeof(InputT)) % 16 == 0 &&
+                     (output_desc.start_off * sizeof(OutputT)) % 16 == 0 &&
+                     (output_desc.stride *sizeof(OutputT)) % 16 == 0 &&
+                     (output_desc.dim * sizeof(OutputT)) % 16 == 0;
+  bool no_data_transfer = (sizeof(InputT) == sizeof(OutputT));
+  bool with_in_buf_size = embedding_desc.dim * sizeof(InputT) <= 6144;
+  bool hopper_arch = false;
+#if __CUDA_ARCH__ == 900
+  hopper_arch = true;
+#endif
+  bool use_TMA = TMA_aligned && no_data_transfer && hopper_arch && with_in_buf_size;
+  int SM_count, thread_num;
+  void (*kernel_fn)(EmbeddingT*,
+                    desc,
+                    const IndexT*,
+                    int64_t,
+                    OutputT*,
+                    desc) = nullptr;
+  if (use_TMA) {
+    SM_count = indice_count > 1568 ? 1568 : indice_count;
+    thread_num = 32;
+    switch (alignment) {
+      case 16: { kernel_fn = gather_func_kernel_TMA<16>; break;}
+      case 8: { kernel_fn = gather_func_kernel_TMA<8>; break;}
+      case 4: { kernel_fn = gather_func_kernel_TMA<4>; break;}
+      case 2: { kernel_fn = gather_func_kernel_TMA<2>; break;}
+      case 1: { kernel_fn = gather_func_kernel_TMA<1>; break;}
+      default: {
+        printf("gather func alignment=%d.", alignment);
+        return;
+      }
+    }
+  } else {
+    SM_count = indice_count / 32 > 1568 ? 1568 : indice_count / 32;
+    thread_num = 1024;
+    switch (alignment) {
+      case 16: { kernel_fn = gather_func_kernel<16>; break;}
+      case 8: { kernel_fn = gather_func_kernel<8>; break;}
+      case 4: { kernel_fn = gather_func_kernel<4>; break;}
+      case 2: { kernel_fn = gather_func_kernel<2>; break;}
+      case 1: { kernel_fn = gather_func_kernel<1>; break;}
+      default: {
+        printf("gather func alignment=%d.", alignment);
+        return;
+      }
+    }
+  }
+#endif
   cudaEvent_t start, stop;
 	float esp_time_gpu;
 	CUDA_TRY(cudaEventCreate(&start));
@@ -688,6 +882,23 @@ void gather_temp_func(EmbeddingT *embedding,
                                                                   indice_count,
                                                                   output,
                                                                   output_desc);
+#endif
+#ifdef TMA_COPY
+  if (use_TMA) {
+    kernel_fn<<<SM_count * 32, thread_num>>>(embedding,
+                                        embedding_desc,
+                                        indices,
+                                        indice_count,
+                                        output,
+                                        output_desc);
+  } else {
+    kernel_fn<<<SM_count, thread_num>>>(embedding,
+                                        embedding_desc,
+                                        indices,
+                                        indice_count,
+                                        output,
+                                        output_desc);
+  }
 #endif
   CUDA_TRY(cudaDeviceSynchronize());
   CUDA_TRY(cudaEventRecord(stop, 0));
