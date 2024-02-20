@@ -763,8 +763,10 @@ __global__ void gather_func_kernel_TMA_V2(EmbeddingT* embedding,
                                        OutputT* output,
                                        desc output_desc)
 {
-  __shared__ alignas(16) char shmem[196608];
-  InputT* sh_buf = reinterpret_cast<InputT*>(shmem + threadIdx.x * 6144);
+  __shared__ alignas(16) char shmem[49152];
+  int sh_mem_off = threadIdx.x < 8 ? threadIdx.x : 0;
+  InputT* sh_buf = reinterpret_cast<InputT*>(shmem + sh_mem_off * 6144);
+  //only eight threads are working
   __shared__ barrier bar;
   if (threadIdx.x == 0) { init(&bar, blockDim.x); }
   __syncwarp();
@@ -773,11 +775,11 @@ __global__ void gather_func_kernel_TMA_V2(EmbeddingT* embedding,
   int64_t embedding_stride = embedding_desc.stride;
   int64_t output_stride    = output_desc.stride;
 
-  int tid = threadIdx.x + blockIdx.x * blockDim.x;
-  for (int64_t output_idx = tid; output_idx < indice_count; output_idx += gridDim.x * blockDim.x) {
+  int tid = threadIdx.x + (blockIdx.x * blockDim.x) / 32 * 8;
+  for (int64_t output_idx = tid; output_idx < indice_count; output_idx += (gridDim.x * blockDim.x) / 4) {
     OutputT* output_ptr = output + output_desc.start_off + output_stride * output_idx;
-    IndexT embedding_table_idx = indices[output_idx];
-    bool exec_copy = true;
+    bool exec_copy = threadIdx.x < 8 ? true : false;
+    IndexT embedding_table_idx = exec_copy ? indices[output_idx] : -1;
     if (embedding_table_idx < 0)
       exec_copy = false;
     EmbeddingT* emb_ptr = embedding + embedding_desc.start_off + embedding_table_idx * embedding_stride;
@@ -937,7 +939,7 @@ void gather_temp_func(EmbeddingT *embedding,
                     OutputT*,
                     desc) = nullptr;
   if (use_TMA) {
-    SM_count = indice_count > 49 ? 49 : indice_count;
+    SM_count = indice_count > 132 ? 132 : indice_count;
     thread_num = 32;
     switch (alignment) {
       case 16: { kernel_fn = gather_func_kernel_TMA_V2<16>; break;}
@@ -1008,7 +1010,7 @@ void gather_temp_func(EmbeddingT *embedding,
 #endif
 #ifdef TMA_COPY_V2
   if (use_TMA) {
-    kernel_fn<<<SM_count * 32, thread_num>>>(embedding,
+    kernel_fn<<<SM_count * 4, thread_num>>>(embedding,
                                         embedding_desc,
                                         indices,
                                         indice_count,
